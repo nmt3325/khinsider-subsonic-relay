@@ -1,0 +1,12 @@
+services:
+  khinsider-subsonic:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      SUBSONIC_USER: admin
+      SUBSONIC_PASSWORD: change-me
+      # PROXY_STREAM: "1"   # リダイレクト非対応クライアント用の中継モード
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
