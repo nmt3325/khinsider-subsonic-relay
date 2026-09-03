@@ -76,7 +76,8 @@ Subsonic API 互換クライアント（Symfonium / Tempo / DSub / Substreamer /
 | `SUBSONIC_PASSWORD` | `admin` | パスワード（必ず変更すること） |
 | `PORT` | `8080` | 待受ポート |
 | `LIBRARY_PATH` | `./library.json` | ライブラリデータのパス（`.gz` も可） |
-| `LIBRARY_URL` | index リリースのURL | library.json の取得元 |
+| `LIBRARY_URL` | `.../releases/latest/download/library.json` | library.json の取得元。常に最新のリリースを指す |
+| `LIBRARY_MAX_AGE_HOURS` | `0` | 起動時、キャッシュがこの時間より古ければ再取得（`0` は再取得しない）。index 側は毎日リリースを更新するので、常設運用なら `24` 程度が目安 |
 | `CACHE_DIR` | `./cache` | ページキャッシュ先（アルバム30日） |
 | `PROXY_STREAM` | - | `1` で302ではなくサーバー中継 |
 | `GENRE_SOURCES` | `platform,album_type` | ジャンルに使う項目と順序。`album_type,platform` や `album_type` 単独も可 |

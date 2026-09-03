@@ -39,6 +39,8 @@ Config (env):
   LIBRARY_PATH                       - library.json (auto-downloaded if missing,
                                        .gz accepted)
   LIBRARY_URL                        - override download URL for library.json
+  LIBRARY_MAX_AGE_HOURS              - re-download library.json at startup when the
+                                       cached copy is older than this (0 = never)
   CACHE_DIR                          - page cache dir (default: ./cache)
   PROXY_STREAM                       - '1' to always proxy instead of 302
   GENRE_SOURCES                      - which fields become genres, in order
@@ -74,8 +76,8 @@ CACHE_DIR = os.environ.get('CACHE_DIR', './cache')
 LIBRARY_PATH = os.environ.get('LIBRARY_PATH', './library.json')
 LIBRARY_URL = os.environ.get(
     'LIBRARY_URL',
-    'https://github.com/nmt3325/khinsider-index/releases/download/v2026.09.01/library.json',
-)
+    'https://github.com/nmt3325/khinsider-index/releases/latest/download/library.json')
+LIBRARY_MAX_AGE_HOURS = float(os.environ.get('LIBRARY_MAX_AGE_HOURS', '0'))
 PROXY_STREAM = os.environ.get('PROXY_STREAM', '') == '1'
 GENRE_SOURCES = [s.strip().lower() for s in os.environ.get('GENRE_SOURCES', 'platform,album_type').split(',') if s.strip()]
 ARTIST_MODE = os.environ.get('ARTIST_MODE', 'auto').strip().lower()
@@ -233,10 +235,25 @@ def _load_json_file(path):
         return json.load(f)
 
 
+def library_is_stale():
+    if LIBRARY_MAX_AGE_HOURS <= 0:
+        return False
+    return time.time() - os.path.getmtime(LIBRARY_PATH) > LIBRARY_MAX_AGE_HOURS * 3600
+
+
 def ensure_library():
-    if not os.path.exists(LIBRARY_PATH):
-        print(f'downloading library from {LIBRARY_URL} ...')
-        urllib.request.urlretrieve(LIBRARY_URL, LIBRARY_PATH)
+    if os.path.exists(LIBRARY_PATH) and not library_is_stale():
+        return _load_json_file(LIBRARY_PATH)
+    print(f'downloading library from {LIBRARY_URL} ...')
+    tmp = LIBRARY_PATH + '.part'
+    try:
+        urllib.request.urlretrieve(LIBRARY_URL, tmp)
+        os.replace(tmp, LIBRARY_PATH)
+    except Exception as exc:
+        # a failed refresh must never take a working server down
+        if not os.path.exists(LIBRARY_PATH):
+            raise
+        print(f'library refresh failed ({exc}); keeping the cached copy')
     return _load_json_file(LIBRARY_PATH)
 
 
