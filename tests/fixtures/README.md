@@ -1,0 +1,1 @@
+Frozen main-content and player excerpt from https://downloads.khinsider.com/game-soundtracks/album/va-2024, captured 2026-09-05. Tests parse the JavaScript as data and do not execute it or download audio.

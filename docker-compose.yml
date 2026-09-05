@@ -13,6 +13,9 @@ services:
       # index の自動更新。起動時だけでなく、稼働中も定期的に再チェックする（0 で無効）
       LIBRARY_REFRESH_HOURS: "24"
       SONGS_REFRESH_HOURS: "24"
+      # 独自SONGS_URLを使う場合は対応するmanifestだけを明示指定する
+      # SONGS_MANIFEST_URL: "https://your-host.example/songs-index.json"
+      # SONGS_MANIFEST_URL: ""  # manifestを使わずgzipの内容検証にする
       # PROXY_STREAM: "1"   # リダイレクト非対応クライアント用の中継モード
       # SONG_SEARCH: "off"  # 曲名検索を無効化（曲 DB を作らない = 約 600MB 節約）
     volumes:

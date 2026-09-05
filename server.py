@@ -77,6 +77,7 @@ from bs4.element import Comment, NavigableString, Tag
 from curl_cffi import requests as creq
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from khinsider_player import extract_player_urls, valid_mp3_url
 
 try:
     import songs as song_index
@@ -106,7 +107,7 @@ ARTIST_MODE = os.environ.get('ARTIST_MODE', 'auto').strip().lower()
 FALLBACK_ARTIST = os.environ.get('FALLBACK_ARTIST', 'KHInsider')
 
 # bump when the shape of a cached album changes so old caches are re-parsed
-ALBUM_CACHE_VERSION = 2
+ALBUM_CACHE_VERSION = 3
 
 AUDIO_EXT_RE = re.compile(r'\.(mp3|flac|ogg|m4a|opus|wma|wav)$', re.I)
 CONTENT_TYPES = {
@@ -263,8 +264,27 @@ def library_is_stale():
     return time.time() - os.path.getmtime(LIBRARY_PATH) > LIBRARY_MAX_AGE_HOURS * 3600
 
 
+
 def _http_meta_path():
     return LIBRARY_PATH + '.http.json'
+
+
+def _unique_tmp_path(path, suffix='.tmp'):
+    return '%s.%d.%d.%d%s' % (
+        path, os.getpid(), threading.get_ident(), time.time_ns(), suffix)
+
+
+def _atomic_json_dump(path, data):
+    tmp = _unique_tmp_path(path)
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def _load_http_meta():
@@ -275,10 +295,13 @@ def _load_http_meta():
         return {}
 
 
+def _http_meta_matches_source(meta):
+    return meta.get('source') == LIBRARY_URL
+
+
 def _save_http_meta(meta):
     try:
-        with open(_http_meta_path(), 'w', encoding='utf-8') as f:
-            json.dump(meta, f)
+        _atomic_json_dump(_http_meta_path(), meta)
     except Exception:
         pass
 
@@ -291,15 +314,41 @@ def _file_digest(path):
     return h.hexdigest()
 
 
+def _validate_library_data(lib):
+    if not isinstance(lib, dict):
+        raise ValueError('library.json must be an object')
+    albums = lib.get('albums')
+    if not isinstance(albums, list):
+        raise ValueError('library.json missing albums[]')
+    for i, album in enumerate(albums, 1):
+        if not isinstance(album, dict):
+            raise ValueError('library album #%d is not an object' % i)
+        slug = album.get('slug')
+        title = album.get('title') or album.get('name') or slug
+        if not isinstance(slug, str) or not slug.strip():
+            raise ValueError('library album #%d missing slug' % i)
+        if title is not None and not isinstance(title, str):
+            raise ValueError('library album #%d has invalid title' % i)
+    return lib
+
+
+def _load_library_candidate(path):
+    return _validate_library_data(_load_json_file(path))
+
+
 def fetch_library(conditional=True):
     """Download library.json. True only when a genuinely new file was written."""
-    known = _load_http_meta() if conditional and os.path.exists(LIBRARY_PATH) else {}
+    have_local = os.path.exists(LIBRARY_PATH)
+    known = _load_http_meta() if have_local else {}
+    source_bound = have_local and _http_meta_matches_source(known)
+    can_revalidate = (conditional and source_bound and
+                      bool(known.get('etag') or known.get('last_modified')))
     headers = {'User-Agent': 'khinsider-subsonic-relay'}
-    if known.get('etag'):
+    if can_revalidate and known.get('etag'):
         headers['If-None-Match'] = known['etag']
-    if known.get('last_modified'):
+    if can_revalidate and known.get('last_modified'):
         headers['If-Modified-Since'] = known['last_modified']
-    tmp = LIBRARY_PATH + '.part'
+    tmp = _unique_tmp_path(LIBRARY_PATH, '.part')
     try:
         req = urllib.request.Request(LIBRARY_URL, headers=headers)
         with urllib.request.urlopen(req, timeout=300) as r, open(tmp, 'wb') as f:
@@ -308,10 +357,14 @@ def fetch_library(conditional=True):
                 if not chunk:
                     break
                 f.write(chunk)
-            fresh = {'etag': r.headers.get('ETag') or '',
-                     'last_modified': r.headers.get('Last-Modified') or ''}
+            fresh = {
+                'etag': r.headers.get('ETag') or '',
+                'last_modified': r.headers.get('Last-Modified') or '',
+                'source': LIBRARY_URL,
+            }
         fresh['digest'] = _file_digest(tmp)
-        if os.path.exists(LIBRARY_PATH) and known.get('digest') == fresh['digest']:
+        _load_library_candidate(tmp)
+        if have_local and known.get('digest') == fresh['digest']:
             _save_http_meta(fresh)
             return False
         os.replace(tmp, LIBRARY_PATH)
@@ -319,6 +372,8 @@ def fetch_library(conditional=True):
         return True
     except urllib.error.HTTPError as exc:
         if exc.code == 304:
+            if not can_revalidate:
+                raise ValueError('unexpected 304 for mismatched library source')
             return False
         raise
     finally:
@@ -327,17 +382,19 @@ def fetch_library(conditional=True):
 
 
 def ensure_library():
-    if os.path.exists(LIBRARY_PATH) and not library_is_stale():
-        return _load_json_file(LIBRARY_PATH)
+    have_local = os.path.exists(LIBRARY_PATH)
+    known = _load_http_meta() if have_local else {}
+    if have_local and _http_meta_matches_source(known) and not library_is_stale():
+        return _load_library_candidate(LIBRARY_PATH)
     print(f'downloading library from {LIBRARY_URL} ...')
     try:
-        fetch_library(conditional=os.path.exists(LIBRARY_PATH))
+        fetch_library(conditional=have_local)
     except Exception as exc:
-        # a failed refresh must never take a working server down
-        if not os.path.exists(LIBRARY_PATH):
+        if not have_local:
             raise
         print(f'library refresh failed ({exc}); keeping the cached copy')
-    return _load_json_file(LIBRARY_PATH)
+    return _load_library_candidate(LIBRARY_PATH)
+
 
 
 ALBUMS = {}          # slug -> metadata dict (title, letter, year, publishers, ...)
@@ -412,7 +469,7 @@ def refresh_library():
     """Re-check library.json upstream and swap the indexes when it changed."""
     if not fetch_library():
         return False
-    build_library_indexes(_load_json_file(LIBRARY_PATH))
+    build_library_indexes(_load_library_candidate(LIBRARY_PATH))
     return True
 
 
@@ -566,12 +623,58 @@ def _cache_get(kind, key, max_age=None):
         return None
 
 
+
 def _cache_put(kind, key, data):
     path = _cache_path(kind, key)
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f)
-    os.replace(tmp, path)
+    tmp = _unique_tmp_path(path)
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+_flight_lock = threading.Lock()
+_flights = {}
+
+
+def _singleflight(key, fn):
+    leader = False
+    with _flight_lock:
+        call = _flights.get(key)
+        if call is None:
+            call = {'event': threading.Event(), 'waiters': 0,
+                    'result': None, 'exc': None}
+            _flights[key] = call
+            leader = True
+        else:
+            call['waiters'] += 1
+    if not leader:
+        call['event'].wait()
+        with _flight_lock:
+            call['waiters'] -= 1
+            if call['waiters'] == 0 and call['event'].is_set():
+                _flights.pop(key, None)
+        if call['exc'] is not None:
+            raise call['exc']
+        return call['result']
+    try:
+        call['result'] = fn()
+    except Exception as exc:
+        call['exc'] = exc
+    finally:
+        call['event'].set()
+        with _flight_lock:
+            if call['waiters'] == 0:
+                _flights.pop(key, None)
+    if call['exc'] is not None:
+        raise call['exc']
+    return call['result']
+
 
 # ---------------- khinsider page parsing ----------------
 
@@ -728,6 +831,7 @@ def _songlist_roles(table):
     return roles
 
 
+
 def _parse_songlist(table, slug):
     """Parse table#songlist into track dicts (header aware + regex fallback)."""
     roles = _songlist_roles(table)
@@ -747,8 +851,14 @@ def _parse_songlist(table, slug):
                 break
         if not basename:
             continue
-        t = {'basename': basename, 'num': None, 'disc': None, 'title': None,
-             'duration': None, 'sizes': {}}
+        add_to = tr.select_one('div.playlistAddTo[songid]')
+        songid = None
+        if add_to is not None:
+            raw_songid = (add_to.get('songid') or '').strip()
+            if raw_songid.isdecimal():
+                songid = raw_songid
+        t = {'basename': basename, 'songid': songid, 'num': None, 'disc': None,
+             'title': None, 'duration': None, 'sizes': {}}
         for idx, cell in enumerate(cells):
             role = roles.get(idx)
             text = cell.get_text(' ', strip=True)
@@ -767,13 +877,16 @@ def _parse_songlist(table, slug):
                 if size:
                     t['sizes'][role[5:]] = size
         if t['title'] is None or t['duration'] is None or not t['sizes']:
-            # fallback for layouts without a usable header row
             sizes_seen = []
             for cell in cells:
                 text = cell.get_text(' ', strip=True)
                 if not text:
                     continue
-                if t['title'] is None and cell.find('a', href=True) and not AUDIO_EXT_RE.search(text) and not SIZE_RE.match(text) and not DURATION_RE.match(text) and not NUM_RE.match(text):
+                if (t['title'] is None and cell.find('a', href=True)
+                        and not AUDIO_EXT_RE.search(text)
+                        and not SIZE_RE.match(text)
+                        and not DURATION_RE.match(text)
+                        and not NUM_RE.match(text)):
                     t['title'] = text
                 elif t['duration'] is None and DURATION_RE.match(text):
                     t['duration'] = _duration(text)
@@ -788,11 +901,14 @@ def _parse_songlist(table, slug):
         if not t['title']:
             t['title'] = os.path.splitext(basename)[0]
         t['num'] = t['num'] or len(tracks) + 1
-        formats = [f for f in ('mp3', 'flac', 'ogg', 'm4a', 'opus', 'wma', 'wav') if f in t['sizes']]
+        formats = [f for f in ('mp3', 'flac', 'ogg', 'm4a', 'opus', 'wma', 'wav')
+                   if f in t['sizes']]
         t['formats'] = formats or ['mp3']
         t['size'] = t['sizes'].get(t['formats'][0])
         tracks.append(t)
     return tracks
+
+
 
 
 def load_album(slug):
@@ -800,64 +916,129 @@ def load_album(slug):
     cached = _cache_get('albums', slug, max_age=30 * 86400)
     if cached and cached.get('v') == ALBUM_CACHE_VERSION:
         return cached
+
+    def leader():
+        cached = _cache_get('albums', slug, max_age=30 * 86400)
+        if cached and cached.get('v') == ALBUM_CACHE_VERSION:
+            return cached
+        try:
+            r = sess.get('%s/game-soundtracks/album/%s' % (BASE, slug), timeout=30)
+        except Exception as exc:
+            print('album fetch failed for %s: %s' % (slug, exc))
+            return None
+        if r.status_code != 200:
+            return None
+        soup = BeautifulSoup(r.text, 'html.parser')
+        h2 = soup.select_one('#pageContent h2')
+        title = h2.get_text(' ', strip=True) if h2 else None
+        if not title or title.lower().startswith('ooops'):
+            return None
+        covers = _dedupe([a['href'] for a in soup.select('div.albumImage a[href]')])
+        table = soup.select_one('table#songlist')
+        tracks = _parse_songlist(table, slug) if table else []
+        player_urls = extract_player_urls(r.text, slug)
+        if player_urls:
+            for track in tracks:
+                songid = track.get('songid')
+                url = player_urls.get(songid) if songid else None
+                if url and valid_mp3_url(url, slug):
+                    track['mp3_url'] = url
+        alt = soup.select_one('p.albuminfoAlternativeTitles')
+        album = {
+            'v': ALBUM_CACHE_VERSION,
+            'slug': slug,
+            'title': title,
+            'cover': covers[0] if covers else None,
+            'covers': covers,
+            'alt_titles': alt.get_text(' ', strip=True) if alt else None,
+            'info': parse_album_info(soup),
+            'tracks': tracks,
+        }
+        _cache_put('albums', slug, album)
+        return album
+
     try:
-        r = sess.get('%s/game-soundtracks/album/%s' % (BASE, slug), timeout=30)
+        return _singleflight('album:' + slug, leader)
     except Exception as exc:
         print('album fetch failed for %s: %s' % (slug, exc))
         return None
-    if r.status_code != 200:
-        return None
-    soup = BeautifulSoup(r.text, 'html.parser')
-    h2 = soup.select_one('#pageContent h2')
-    title = h2.get_text(' ', strip=True) if h2 else None
-    if not title or title.lower().startswith('ooops'):
-        return None
-    covers = _dedupe([a['href'] for a in soup.select('div.albumImage a[href]')])
-    table = soup.select_one('table#songlist')
-    tracks = _parse_songlist(table, slug) if table else []
-    alt = soup.select_one('p.albuminfoAlternativeTitles')
-    album = {
-        'v': ALBUM_CACHE_VERSION,
-        'slug': slug,
-        'title': title,
-        'cover': covers[0] if covers else None,
-        'covers': covers,
-        'alt_titles': alt.get_text(' ', strip=True) if alt else None,
-        'info': parse_album_info(soup),
-        'tracks': tracks,
-    }
-    _cache_put('albums', slug, album)
-    return album
 
 
-def resolve_track(slug, basename):
+def _cached_direct_mp3(slug, basename):
+    album = load_album(slug)
+    if not album:
+        return None
+    for track in album.get('tracks') or []:
+        if track.get('basename') != basename:
+            continue
+        url = track.get('mp3_url')
+        if url and valid_mp3_url(url, slug):
+            return {'files': {'mp3': url}}
+        return None
+    return None
+
+
+def _resolve_track_page(slug, basename):
     """Track page -> {'files': {ext: cdn_url}}, cached for 30 days."""
     key = '%s/%s' % (slug, basename)
     cached = _cache_get('tracks', key, max_age=30 * 86400)
     if cached:
         return cached
-    url = '%s/game-soundtracks/album/%s/%s' % (BASE, slug, urllib.parse.quote(basename))
+
+    def leader():
+        cached = _cache_get('tracks', key, max_age=30 * 86400)
+        if cached:
+            return cached
+        url = '%s/game-soundtracks/album/%s/%s' % (
+            BASE, slug, urllib.parse.quote(basename))
+        try:
+            r = sess.get(url, timeout=30)
+        except Exception as exc:
+            print('track fetch failed for %s: %s' % (key, exc))
+            return None
+        if r.status_code != 200:
+            return None
+        soup = BeautifulSoup(r.text, 'html.parser')
+        files = {}
+        for span in soup.select('span.songDownloadLink'):
+            a = span.find_parent('a')
+            if not a or not a.get('href'):
+                continue
+            m = AUDIO_EXT_RE.search(urllib.parse.urlparse(a['href']).path)
+            if m:
+                files.setdefault(m.group(1).lower(), a['href'])
+        if not files:
+            return None
+        data = {'files': files}
+        _cache_put('tracks', key, data)
+        return data
+
     try:
-        r = sess.get(url, timeout=30)
+        return _singleflight('track:' + key, leader)
     except Exception as exc:
         print('track fetch failed for %s: %s' % (key, exc))
         return None
-    if r.status_code != 200:
-        return None
-    soup = BeautifulSoup(r.text, 'html.parser')
-    files = {}
-    for span in soup.select('span.songDownloadLink'):
-        a = span.find_parent('a')
-        if not a or not a.get('href'):
-            continue
-        m = AUDIO_EXT_RE.search(urllib.parse.urlparse(a['href']).path)
-        if m:
-            files.setdefault(m.group(1).lower(), a['href'])
+
+
+def resolve_track(slug, basename, requested_format=None):
+    if requested_format == 'mp3':
+        direct = _cached_direct_mp3(slug, basename)
+        if direct is not None:
+            return direct
+    return _resolve_track_page(slug, basename)
+
+
+def _resolve_stream_url(slug, track, want=''):
+    preferred = (track.get('formats') or ['mp3'])[0]
+    resolved = resolve_track(slug, track['basename'], requested_format=(want or preferred))
+    if not resolved:
+        return None, None
+    files = dict(resolved.get('files') or {})
     if not files:
-        return None
-    data = {'files': files}
-    _cache_put('tracks', key, data)
-    return data
+        return None, None
+    url = files.get(want) or files.get(preferred) or files.get('mp3') or next(iter(files.values()), None)
+    return url, files
+
 
 # ---------------- subsonic models ----------------
 
@@ -1229,13 +1410,10 @@ async def subsonic(endpoint: str, request: Request):
         if not album or idx < 1 or idx > len(album['tracks']):
             return sub_error(fmt, 70, 'Song not found.')
         track = album['tracks'][idx - 1]
-        resolved = resolve_track(slug, track['basename'])
-        if not resolved:
-            return sub_error(fmt, 70, 'Song not found.')
-        files = resolved['files']
         want = (q.get('format') or '').lower()
-        url = (files.get(want) or files.get((track.get('formats') or ['mp3'])[0])
-               or files.get('mp3') or next(iter(files.values())))
+        url, files = _resolve_stream_url(slug, track, want=want)
+        if not url:
+            return sub_error(fmt, 70, 'Song not found.')
         if not (PROXY_STREAM or q.get('proxy') == '1'):
             return RedirectResponse(url, status_code=302)
         suffix = (AUDIO_EXT_RE.search(urllib.parse.urlparse(url).path).group(1) or 'mp3').lower()
