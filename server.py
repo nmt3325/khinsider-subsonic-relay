@@ -39,8 +39,12 @@ Config (env):
   LIBRARY_PATH                       - library.json (auto-downloaded if missing,
                                        .gz accepted)
   LIBRARY_URL                        - override download URL for library.json
-  LIBRARY_MAX_AGE_HOURS              - re-download library.json at startup when the
-                                       cached copy is older than this (0 = never)
+  LIBRARY_REFRESH_HOURS              - how often the running server re-checks
+                                       library.json (default 24, 0 = never); the
+                                       check is conditional, so an unchanged
+                                       release only costs an HTTP 304
+  LIBRARY_MAX_AGE_HOURS              - startup staleness threshold (defaults to
+                                       LIBRARY_REFRESH_HOURS)
   CACHE_DIR                          - page cache dir (default: ./cache)
   PROXY_STREAM                       - '1' to always proxy instead of 302
   GENRE_SOURCES                      - which fields become genres, in order
@@ -48,6 +52,12 @@ Config (env):
   ARTIST_MODE                        - auto | publisher | letter (default auto):
                                        what getArtists lists
   FALLBACK_ARTIST                    - artist used when no publisher is known
+  SONG_SEARCH                        - 'off' disables song-title search
+  SONGS_URL / SONGS_DB               - song index source / local database file
+  SONGS_REFRESH_HOURS                - how often to re-check the song index
+                                       (default 24, 0 = never)
+  SONGS_MAX_AGE_DAYS                 - rebuild the song database when it is older
+                                       than this even if unchanged (0 = never)
 """
 import gzip
 import hashlib
@@ -55,7 +65,9 @@ import json
 import os
 import random
 import re
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -85,7 +97,9 @@ LIBRARY_PATH = os.environ.get('LIBRARY_PATH', './library.json')
 LIBRARY_URL = os.environ.get(
     'LIBRARY_URL',
     'https://github.com/nmt3325/khinsider-index/releases/latest/download/library.json')
-LIBRARY_MAX_AGE_HOURS = float(os.environ.get('LIBRARY_MAX_AGE_HOURS', '0'))
+LIBRARY_REFRESH_HOURS = float(os.environ.get('LIBRARY_REFRESH_HOURS', '24'))
+# older, startup-only spelling of the same knob
+LIBRARY_MAX_AGE_HOURS = float(os.environ.get('LIBRARY_MAX_AGE_HOURS', '0')) or LIBRARY_REFRESH_HOURS
 PROXY_STREAM = os.environ.get('PROXY_STREAM', '') == '1'
 GENRE_SOURCES = [s.strip().lower() for s in os.environ.get('GENRE_SOURCES', 'platform,album_type').split(',') if s.strip()]
 ARTIST_MODE = os.environ.get('ARTIST_MODE', 'auto').strip().lower()
@@ -249,14 +263,75 @@ def library_is_stale():
     return time.time() - os.path.getmtime(LIBRARY_PATH) > LIBRARY_MAX_AGE_HOURS * 3600
 
 
+def _http_meta_path():
+    return LIBRARY_PATH + '.http.json'
+
+
+def _load_http_meta():
+    try:
+        with open(_http_meta_path(), encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_http_meta(meta):
+    try:
+        with open(_http_meta_path(), 'w', encoding='utf-8') as f:
+            json.dump(meta, f)
+    except Exception:
+        pass
+
+
+def _file_digest(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fetch_library(conditional=True):
+    """Download library.json. True only when a genuinely new file was written."""
+    known = _load_http_meta() if conditional and os.path.exists(LIBRARY_PATH) else {}
+    headers = {'User-Agent': 'khinsider-subsonic-relay'}
+    if known.get('etag'):
+        headers['If-None-Match'] = known['etag']
+    if known.get('last_modified'):
+        headers['If-Modified-Since'] = known['last_modified']
+    tmp = LIBRARY_PATH + '.part'
+    try:
+        req = urllib.request.Request(LIBRARY_URL, headers=headers)
+        with urllib.request.urlopen(req, timeout=300) as r, open(tmp, 'wb') as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+            fresh = {'etag': r.headers.get('ETag') or '',
+                     'last_modified': r.headers.get('Last-Modified') or ''}
+        fresh['digest'] = _file_digest(tmp)
+        if os.path.exists(LIBRARY_PATH) and known.get('digest') == fresh['digest']:
+            _save_http_meta(fresh)
+            return False
+        os.replace(tmp, LIBRARY_PATH)
+        _save_http_meta(fresh)
+        return True
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            return False
+        raise
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 def ensure_library():
     if os.path.exists(LIBRARY_PATH) and not library_is_stale():
         return _load_json_file(LIBRARY_PATH)
     print(f'downloading library from {LIBRARY_URL} ...')
-    tmp = LIBRARY_PATH + '.part'
     try:
-        urllib.request.urlretrieve(LIBRARY_URL, tmp)
-        os.replace(tmp, LIBRARY_PATH)
+        fetch_library(conditional=os.path.exists(LIBRARY_PATH))
     except Exception as exc:
         # a failed refresh must never take a working server down
         if not os.path.exists(LIBRARY_PATH):
@@ -265,41 +340,105 @@ def ensure_library():
     return _load_json_file(LIBRARY_PATH)
 
 
-_lib = ensure_library()
 ALBUMS = {}          # slug -> metadata dict (title, letter, year, publishers, ...)
 LETTER_ALBUMS = {}   # letter -> [(slug, title)] sorted by title
 PUB_ALBUMS = {}      # publisher (or developer) -> [(slug, title)]
 GENRE_ALBUMS = {}    # genre name -> [slug]
 SEARCH = []          # (lower_title, slug)
+LETTERS = []
+PUBLISHERS = []
+GENRES = []
+ALPHA_SLUGS = []     # every slug, alphabetical
+YEAR_SLUGS = []      # slugs carrying a year, oldest first
+NEWEST_SLUGS = []    # slugs carrying date_added, newest first
 LIB_META_ALBUMS = 0  # how many rows actually carry extra metadata
+USE_PUB_ARTISTS = False
+LIBRARY_BUILT = 0.0
 
-for a in _lib['albums']:
-    slug = a['slug']
-    meta = normalize_meta(a)
-    ALBUMS[slug] = meta
-    LETTER_ALBUMS.setdefault(meta['letter'], []).append((slug, meta['title']))
-    SEARCH.append((meta['title'].lower(), slug))
-    if meta['year'] or meta['publishers'] or meta['platforms'] or meta['album_type']:
-        LIB_META_ALBUMS += 1
-    for p in (meta['publishers'] or meta['developers']):
-        PUB_ALBUMS.setdefault(p, []).append((slug, meta['title']))
-for L in LETTER_ALBUMS:
-    LETTER_ALBUMS[L].sort(key=lambda x: x[1].lower())
-for p in PUB_ALBUMS:
-    PUB_ALBUMS[p].sort(key=lambda x: x[1].lower())
-LETTERS = ['0-9'] + [chr(c) for c in range(ord('A'), ord('Z') + 1)]
-LETTERS = [L for L in LETTERS if L in LETTER_ALBUMS]
-PUBLISHERS = sorted(PUB_ALBUMS.keys(), key=lambda s: s.lower())
-USE_PUB_ARTISTS = ARTIST_MODE == 'publisher' or (ARTIST_MODE == 'auto' and bool(PUB_ALBUMS))
-for slug, meta in ALBUMS.items():
-    for g in genre_list(meta):
-        GENRE_ALBUMS.setdefault(g, []).append(slug)
-for g in GENRE_ALBUMS:
-    GENRE_ALBUMS[g].sort(key=lambda s: ALBUMS[s]['title'].lower())
-GENRES = sorted(GENRE_ALBUMS.keys(), key=lambda s: s.lower())
-print(f'library loaded: {len(ALBUMS)} albums in {len(LETTERS)} sections, '
-      f'{LIB_META_ALBUMS} with metadata, {len(PUBLISHERS)} publishers, {len(GENRES)} genres '
-      f'(artists = {"publisher" if USE_PUB_ARTISTS else "letter"})')
+
+def build_library_indexes(lib):
+    """(Re)build every in-memory index from a parsed library.json.
+
+    Everything is assembled into locals first and published in one go, so a
+    background refresh can never expose half-built indexes to a request.
+    """
+    global ALBUMS, LETTER_ALBUMS, PUB_ALBUMS, GENRE_ALBUMS, SEARCH, LETTERS
+    global PUBLISHERS, GENRES, ALPHA_SLUGS, YEAR_SLUGS, NEWEST_SLUGS
+    global LIB_META_ALBUMS, USE_PUB_ARTISTS, LIBRARY_BUILT
+
+    albums, letter_albums, pub_albums, genre_albums, search = {}, {}, {}, {}, []
+    meta_albums = 0
+    for a in lib['albums']:
+        slug = a['slug']
+        meta = normalize_meta(a)
+        albums[slug] = meta
+        letter_albums.setdefault(meta['letter'], []).append((slug, meta['title']))
+        search.append((meta['title'].lower(), slug))
+        if meta['year'] or meta['publishers'] or meta['platforms'] or meta['album_type']:
+            meta_albums += 1
+        for p in (meta['publishers'] or meta['developers']):
+            pub_albums.setdefault(p, []).append((slug, meta['title']))
+    for L in letter_albums:
+        letter_albums[L].sort(key=lambda x: x[1].lower())
+    for p in pub_albums:
+        pub_albums[p].sort(key=lambda x: x[1].lower())
+    letters = [L for L in ['0-9'] + [chr(c) for c in range(ord('A'), ord('Z') + 1)]
+               if L in letter_albums]
+    for slug, meta in albums.items():
+        for g in genre_list(meta):
+            genre_albums.setdefault(g, []).append(slug)
+    for g in genre_albums:
+        genre_albums[g].sort(key=lambda s: albums[s]['title'].lower())
+
+    ALBUMS, LETTER_ALBUMS, PUB_ALBUMS, GENRE_ALBUMS, SEARCH = (
+        albums, letter_albums, pub_albums, genre_albums, search)
+    LETTERS = letters
+    PUBLISHERS = sorted(pub_albums.keys(), key=lambda s: s.lower())
+    GENRES = sorted(genre_albums.keys(), key=lambda s: s.lower())
+    USE_PUB_ARTISTS = ARTIST_MODE == 'publisher' or (ARTIST_MODE == 'auto' and bool(pub_albums))
+    ALPHA_SLUGS = [slug for L in letters for slug, _ in letter_albums[L]]
+    YEAR_SLUGS = sorted((s for s, m in albums.items() if m.get('year')),
+                        key=lambda s: (albums[s]['year'], albums[s]['title'].lower()))
+    NEWEST_SLUGS = sorted((s for s, m in albums.items() if m.get('date_added')),
+                          key=lambda s: albums[s]['date_added'], reverse=True)
+    LIB_META_ALBUMS = meta_albums
+    LIBRARY_BUILT = time.time()
+    print(f'library loaded: {len(ALBUMS)} albums in {len(LETTERS)} sections, '
+          f'{LIB_META_ALBUMS} with metadata, {len(PUBLISHERS)} publishers, {len(GENRES)} genres '
+          f'(artists = {"publisher" if USE_PUB_ARTISTS else "letter"})')
+
+
+def refresh_library():
+    """Re-check library.json upstream and swap the indexes when it changed."""
+    if not fetch_library():
+        return False
+    build_library_indexes(_load_json_file(LIBRARY_PATH))
+    return True
+
+
+def _library_refresher():
+    interval = max(60.0, LIBRARY_REFRESH_HOURS * 3600)
+    while True:
+        time.sleep(interval)
+        try:
+            if refresh_library():
+                print(f'library refreshed from {LIBRARY_URL}')
+        except Exception as exc:
+            print(f'library refresh failed ({exc}); keeping the current index')
+
+
+def library_status():
+    return {
+        'albums': len(ALBUMS),
+        'built': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(LIBRARY_BUILT)),
+        'source': LIBRARY_URL,
+        'refreshHours': LIBRARY_REFRESH_HOURS,
+    }
+
+
+build_library_indexes(ensure_library())
+if LIBRARY_REFRESH_HOURS > 0:
+    threading.Thread(target=_library_refresher, name='library-refresh', daemon=True).start()
 
 # ---------------- subsonic plumbing ----------------
 
@@ -819,13 +958,7 @@ def song_child(slug, album_title, meta, t, idx, cover=None):
     d['path'] = '%s/%s/%s' % (_sanitize(d['artist']), _sanitize(album_title), _sanitize(t['basename']))
     return d
 
-# ---------------- derived orderings ----------------
-
-ALPHA_SLUGS = [slug for L in LETTERS for slug, _ in LETTER_ALBUMS[L]]
-YEAR_SLUGS = sorted((s for s, m in ALBUMS.items() if m.get('year')),
-                    key=lambda s: (ALBUMS[s]['year'], ALBUMS[s]['title'].lower()))
-NEWEST_SLUGS = sorted((s for s, m in ALBUMS.items() if m.get('date_added')),
-                      key=lambda s: ALBUMS[s]['date_added'], reverse=True)
+# ALPHA_SLUGS / YEAR_SLUGS / NEWEST_SLUGS are (re)built by build_library_indexes()
 
 app = FastAPI()
 
@@ -1144,6 +1277,8 @@ def root():
         'genres': len(GENRES),
         'artistMode': 'publisher' if USE_PUB_ARTISTS else 'letter',
         'genreSources': GENRE_SOURCES,
+        'library': library_status(),
+        'songIndex': song_index.status() if song_index is not None else {'state': 'unavailable'},
     }
 
 
