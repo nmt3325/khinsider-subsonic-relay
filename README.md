@@ -64,6 +64,8 @@ Docker Compose:
 docker compose up -d
 ```
 
+同梱の `docker-compose.yml` は `khinsider-data` という named volume を `/data` にマウントし、library.json（約24MB）・曲名DB（約600MB）・ページキャッシュをまとめてそこに置きます。コンテナを作り直しても再ダウンロードや再ビルドは走りません。インデックス更新中は新旧2世代が一時的に並ぶので、1.5GB ほど空きを見てください。ホストから直接見えるディレクトリに置きたい場合は `volumes:` の指定を `- ./data:/data` に差し替えます。
+
 ベアメタル:
 
 ```sh
@@ -71,7 +73,7 @@ pip install -r requirements.txt
 SUBSONIC_USER=myuser SUBSONIC_PASSWORD=secret uvicorn server:app --host 0.0.0.0 --port 8080
 ```
 
-`GET /`（認証なし）でライブラリ件数・メタデータ付き件数・publisher 数・ジャンル数・現在のモードを確認できます。
+`GET /`（認証なし）でライブラリ件数・メタデータ付き件数・publisher 数・ジャンル数・現在のモードに加え、library と曲名インデックスの取得状況（`library` / `songIndex`）を確認できます。
 
 ## クライアント設定
 
@@ -87,18 +89,20 @@ Subsonic API 互換クライアント（Symfonium / Tempo / DSub / Substreamer /
 | `SUBSONIC_USER` | `admin` | ログインのユーザー名 |
 | `SUBSONIC_PASSWORD` | `admin` | パスワード（必ず変更すること） |
 | `PORT` | `8080` | 待受ポート |
-| `LIBRARY_PATH` | `./library.json` | ライブラリデータのパス（`.gz` も可） |
+| `LIBRARY_PATH` | `./library.json` | ライブラリデータのパス（`.gz` も可）。Docker では `/data/library.json` |
 | `LIBRARY_URL` | `.../releases/latest/download/library.json` | library.json の取得元。常に最新のリリースを指す |
-| `LIBRARY_MAX_AGE_HOURS` | `0` | 起動時、キャッシュがこの時間より古ければ再取得（`0` は再取得しない）。index 側は毎日リリースを更新するので、常設運用なら `24` 程度が目安 |
-| `CACHE_DIR` | `./cache` | ページキャッシュ先（アルバム30日） |
+| `LIBRARY_REFRESH_HOURS` | `24` | 稼働中に library.json を再チェックする間隔（時間）。`0` で無効。ETag / Last-Modified 付きの条件付き GET なので、更新が無ければ 304 が返るだけで再構築もしません |
+| `LIBRARY_MAX_AGE_HOURS` | `LIBRARY_REFRESH_HOURS` | 起動時にキャッシュを再取得する古さのしきい値。旧来の名前で、通常は指定不要 |
+| `CACHE_DIR` | `./cache` | ページキャッシュ先（アルバム30日）。Docker では `/data/cache` |
 | `PROXY_STREAM` | - | `1` で302ではなくサーバー中継 |
 | `GENRE_SOURCES` | `platform,album_type` | ジャンルに使う項目と順序。`album_type,platform` や `album_type` 単独も可 |
 | `ARTIST_MODE` | `auto` | `auto`（メタデータがあれば publisher）/ `publisher` / `letter` |
 | `FALLBACK_ARTIST` | `KHInsider` | publisher も developer も無い場合のアーティスト名 |
 | `SONG_SEARCH` | `auto` | `off` で曲名検索を無効化（インデックスのDLもビルドもしない） |
 | `SONGS_URL` | `.../releases/download/song-index/songs.tsv.gz` | 曲名インデックスの取得元 |
-| `SONGS_DB` | `./songs.sqlite` | ビルドした曲名DBの置き場所。約600MB使うので Docker では永続ボリューム推奨 |
-| `SONGS_MAX_AGE_DAYS` | `0` | 起動時、DBがこの日数より古ければ作り直す（`0` は作り直さない）。index 側は週次更新なので常設運用なら `7`〜`14` 程度 |
+| `SONGS_DB` | `./songs.sqlite` | ビルドした曲名DBの置き場所。約600MB。Docker では `/data/songs.sqlite` |
+| `SONGS_REFRESH_HOURS` | `24` | 稼働中に曲名インデックスを再チェックする間隔（時間）。`0` で無効。中身が同じなら再ビルドせず、新しければ裏でビルドしてから原子的に差し替え |
+| `SONGS_MAX_AGE_DAYS` | `0` | 内容が変わっていなくても、DBがこの日数より古ければ作り直す（`0` は作り直さない） |
 | `SONG_SEARCH_ALBUM_LIMIT` | `12` | 1クエリで実ページを取得する候補アルバムの上限 |
 | `SONG_SEARCH_CANDIDATES` | `600` | インデックスから取り出す候補行の上限 |
 
@@ -139,7 +143,7 @@ ping / getLicense / getUser / getMusicFolders / getOpenSubsonicExtensions / getI
 
 ## 注意点
 
-- library.json は `LIBRARY_URL` から自動取得され、`LIBRARY_MAX_AGE_HOURS` を設定しておけば起動時に更新されます。index 側は日次でリリースを更新します
+- library.json と曲名インデックスは稼働中も自動で更新されます。`LIBRARY_REFRESH_HOURS` / `SONGS_REFRESH_HOURS`（既定24時間）ごとに条件付き GET で確認し、中身が変わっていた時だけメモリ上のインデックスと曲名DBを差し替えるので、再起動もダウンタイムも不要です。index 側は library を日次、曲名インデックスを週次で更新します
 - アルバム初回アクセス時は実ページ取得のため数百ms〜1秒程度の遅延あり（以後はキャッシュ）
-- 曲名DBのビルド中（初回起動から30秒前後）は曲検索だけが空を返します。ディスクは約600MB必要です
+- 曲名DBのビルド中（初回起動から30秒前後）は曲検索だけが空を返します。ディスクは約600MB、インデックス更新中は新旧2世代が並ぶため一時的に約1.2GB必要です
 - 外部公開する場合は HTTPS 化（Caddy等）と強いパスワードを推奨。Subsonic の legacy `p=` 認証は平文
