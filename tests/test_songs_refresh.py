@@ -427,3 +427,39 @@ def test_search_resolves_disc_specific_track_numbers(monkeypatch, tmp_path):
     finally:
         sys.modules.pop('server', None)
     assert [song['id'] for song in songs] == ['track/album-slug/1', 'track/album-slug/2']
+
+
+@pytest.mark.parametrize('invalid', [
+    {'complete': False}, {'legacy_inputs': ['songs_cached.jsonl.gz']},
+    {'dataset_schema_version': 1}, {'schema_version': 2}, {'sha256': ''},
+])
+def test_declared_live_manifest_cannot_fall_back_to_unverified_gzip(monkeypatch, tmp_path, invalid):
+    mod = load_module(monkeypatch, tmp_path)
+    text = 'demo\t1\t1\tOpening\n'
+    build_good_db(monkeypatch, mod, text)
+    before = Path(mod.SONGS_DB).read_bytes()
+    value = json.loads(manifest_bytes(text))
+    value.update(data_source='khinsider-live-v2', dataset_schema_version=2,
+                 complete=True, legacy_inputs=[])
+    value.update(invalid)
+    net = install_net(monkeypatch, mod, [{'url': mod.SONGS_MANIFEST_URL,
+                                        'data': json.dumps(value).encode()}])
+    assert mod._sync(force=True) is False
+    assert len(net.calls) == 1 and not net.steps
+    assert Path(mod.SONGS_DB).read_bytes() == before
+
+
+def test_complete_live_manifest_builds_a_new_database(monkeypatch, tmp_path):
+    mod = load_module(monkeypatch, tmp_path)
+    text = 'caf%C3%A9\t1\t1\tCafé opening\n'
+    compressed = gzip_bytes(text)
+    value = json.loads(manifest_bytes(text, compressed))
+    value.update(data_source='khinsider-live-v2', dataset_schema_version=2,
+                 complete=True, legacy_inputs=[])
+    net = install_net(monkeypatch, mod, [
+        {'url': mod.SONGS_MANIFEST_URL, 'data': json.dumps(value).encode()},
+        {'url': mod.SONGS_URL, 'data': compressed},
+    ])
+    assert mod._sync(force=True) is True
+    assert not net.steps
+    assert mod.candidates('opening')[0][0] == 'caf%C3%A9'

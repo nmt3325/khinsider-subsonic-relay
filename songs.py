@@ -196,6 +196,10 @@ def _usable(db_path, runtime_bound=False, apply_state=True):
         return None
 
 
+class ModernManifestError(ValueError):
+    """A declared modern dataset must not use the optional-legacy fallback."""
+
+
 def _manifest_request(url):
     req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
     with urllib.request.urlopen(req, timeout=60) as r:
@@ -203,6 +207,11 @@ def _manifest_request(url):
     data = json.loads(raw.decode('utf-8'))
     if not isinstance(data, dict):
         raise ValueError('manifest is not an object')
+    modern = data.get('data_source') == 'khinsider-live-v2'
+    if modern:
+        if (data.get('schema_version') != TSV_SCHEMA or data.get('complete') is not True
+                or data.get('dataset_schema_version') != 2 or data.get('legacy_inputs') != []):
+            raise ModernManifestError('standalone song index is incomplete or contains legacy inputs')
     if int(data.get('schema_version') or 0) != TSV_SCHEMA:
         raise ValueError('unexpected manifest schema')
     manifest = {
@@ -210,6 +219,8 @@ def _manifest_request(url):
         'sha256': _hash_hex(data.get('sha256')),
         'content_sha256': _hash_hex(data.get('content_sha256')),
     }
+    if modern and (not manifest['sha256'] or not manifest['content_sha256']):
+        raise ModernManifestError('standalone song index is missing its hashes')
     if not manifest['sha256'] and not manifest['content_sha256']:
         raise ValueError('manifest has no usable hashes')
     return manifest
@@ -220,6 +231,8 @@ def _load_manifest(url):
         return None
     try:
         return _manifest_request(url)
+    except ModernManifestError:
+        raise
     except urllib.error.HTTPError as exc:
         if exc.code in (404, 410):
             return None
@@ -373,7 +386,11 @@ def _sync(force=False):
     """Shared startup/refresh path. Keeps the last-good DB on every failure."""
     global _conn
     known = _read_meta(SONGS_DB)
-    manifest = _load_manifest(SONGS_MANIFEST_URL)
+    try:
+        manifest = _load_manifest(SONGS_MANIFEST_URL)
+    except ModernManifestError as exc:
+        _note(exc)
+        return False
     trusted = _trusted_meta(known)
     checked = int(time.time())
     _state['checked'] = checked

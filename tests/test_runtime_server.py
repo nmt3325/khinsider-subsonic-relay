@@ -152,6 +152,26 @@ class RuntimeServerTests(unittest.TestCase):
             parts.append(f'<a href="{url}"><span class="songDownloadLink">{ext}</span></a>')
         return '<html>' + ''.join(parts) + '</html>'
 
+    def test_live_library_contract_rejects_partial_or_mixed_payloads(self):
+        module = self.load_server()
+        value = {'data_source': 'khinsider-live-v2', 'complete': True,
+                 'dataset_schema_version': 2, 'legacy_inputs': [],
+                 'albums': [{'slug': 'alpha', 'title': 'Alpha'}]}
+        self.assertEqual(module._validate_library_data(value), value)
+        for key, bad in [('complete', False), ('dataset_schema_version', 1),
+                         ('legacy_inputs', ['index.json'])]:
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError):
+                    module._validate_library_data(dict(value, **{key: bad}))
+
+    def test_encoded_slug_accepts_decoded_album_song_links(self):
+        from bs4 import BeautifulSoup
+        module = self.load_server()
+        soup = BeautifulSoup(self.album_html(slug='café', title='Café theme'), 'html.parser')
+        tracks = module._parse_songlist(soup.find('table'), 'caf%C3%A9')
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0]['title'], 'Café theme')
+
     def test_stream_mp3_fast_path_uses_one_album_get_for_two_tracks(self):
         module = self.load_server()
         album_url = f'{module.BASE}/game-soundtracks/album/va-2024'

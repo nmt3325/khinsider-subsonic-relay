@@ -107,7 +107,7 @@ ARTIST_MODE = os.environ.get('ARTIST_MODE', 'auto').strip().lower()
 FALLBACK_ARTIST = os.environ.get('FALLBACK_ARTIST', 'KHInsider')
 
 # bump when the shape of a cached album changes so old caches are re-parsed
-ALBUM_CACHE_VERSION = 3
+ALBUM_CACHE_VERSION = 4
 
 AUDIO_EXT_RE = re.compile(r'\.(mp3|flac|ogg|m4a|opus|wma|wav)$', re.I)
 CONTENT_TYPES = {
@@ -317,6 +317,10 @@ def _file_digest(path):
 def _validate_library_data(lib):
     if not isinstance(lib, dict):
         raise ValueError('library.json must be an object')
+    if lib.get('data_source') == 'khinsider-live-v2':
+        if (lib.get('complete') is not True or lib.get('dataset_schema_version') != 2
+                or lib.get('legacy_inputs') != []):
+            raise ValueError('standalone library is incomplete or contains legacy inputs')
     albums = lib.get('albums')
     if not isinstance(albums, list):
         raise ValueError('library.json missing albums[]')
@@ -835,7 +839,7 @@ def _songlist_roles(table):
 def _parse_songlist(table, slug):
     """Parse table#songlist into track dicts (header aware + regex fallback)."""
     roles = _songlist_roles(table)
-    prefix = '/game-soundtracks/album/%s/' % slug
+    wanted_slug = urllib.parse.unquote(slug)
     tracks = []
     for tr in table.find_all('tr'):
         if tr.get('id') in ('songlist_header', 'songlist_footer'):
@@ -846,8 +850,10 @@ def _parse_songlist(table, slug):
         basename = None
         for a in tr.find_all('a', href=True):
             href = urllib.parse.urlparse(a['href']).path
-            if prefix in href and AUDIO_EXT_RE.search(href):
-                basename = urllib.parse.unquote(href.rsplit('/', 1)[-1])
+            parts = href.split('/')
+            if (len(parts) == 5 and parts[1:3] == ['game-soundtracks', 'album']
+                    and urllib.parse.unquote(parts[3]) == wanted_slug and AUDIO_EXT_RE.search(href)):
+                basename = urllib.parse.unquote(parts[4])
                 break
         if not basename:
             continue
