@@ -6,7 +6,33 @@ services:
     environment:
       SUBSONIC_USER: admin
       SUBSONIC_PASSWORD: change-me
+      # 永続化先（Dockerfile の既定値と同じだが、明示しておく）
+      LIBRARY_PATH: /data/library.json
+      CACHE_DIR: /data/cache
+      SONGS_DB: /data/songs.sqlite
+      # index の自動更新。起動時だけでなく、稼働中も定期的に再チェックする（0 で無効）
+      LIBRARY_REFRESH_HOURS: "24"
+      SONGS_REFRESH_HOURS: "24"
       # PROXY_STREAM: "1"   # リダイレクト非対応クライアント用の中継モード
+      # SONG_SEARCH: "off"  # 曲名検索を無効化（曲 DB を作らない = 約 600MB 節約）
     volumes:
-      - ./data:/data
+      - khinsider-data:/data
+      # ホスト側の見えるディレクトリに置きたい場合は上の行を消してこちらを使う:
+      # - ./data:/data
     restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT', '8080') + '/', timeout=10)
+      interval: 5m
+      timeout: 15s
+      start_period: 5m
+      retries: 3
+
+volumes:
+  # library.json（約 24MB）、曲インデックス DB（約 600MB）、アルバムページの
+  # HTML キャッシュが入る。曲インデックスの更新中は新旧 2 世代が一時的に
+  # 並ぶので、1.5GB ほど余裕を見ておくと安全。
+  khinsider-data:
