@@ -4,13 +4,14 @@ Subsonic API-compatible relay server that publishes all of downloads.khinsider.c
 
 ## 概要
 
-downloads.khinsider.com の全アルバム（104,431件 / 2026-09-01時点）を Subsonic 互換ライブラリとして公開するリレーサーバーです。音声ファイルは一切保持せず、クライアントからの再生リクエスト時に khinsider の CDN（vgmtreasurechest.com）上の実URLへ **302リダイレクト** します。サーバーには帯域もストレージもほぼ不要です。
+downloads.khinsider.com の全アルバム（104,607件 / 2026-09-04時点）を Subsonic 互換ライブラリとして公開するリレーサーバーです。音声ファイルは一切保持せず、クライアントからの再生リクエスト時に khinsider の CDN（vgmtreasurechest.com）上の実URLへ **302リダイレクト** します。サーバーには帯域もストレージもほぼ不要です。
 
 ## 動作の仕組み
 
 1. アルバム一覧は [khinsider-index](https://github.com/nmt3325/khinsider-index) のライブクロール成果（library.json）を初回起動時に自動ダウンロード
 2. アルバム詳細・トラック一覧・メタデータ・実ファイルURLはクライアントからのアクセス時にオンデマンドで実サイトから取得してキャッシュ（Cloudflare対策として curl_cffi の Chrome TLS フィンガープリントを使用）
 3. `/rest/stream` は実ファイルの CDN URL へ 302 リダイレクト。リダイレクト非対応クライアント向けに `PROXY_STREAM=1` でサーバー中継モードも可
+4. 曲名検索用に、325万曲の曲名インデックスを別途ダウンロードしてローカルの SQLite FTS5 に展開（[曲名検索](#曲名検索)）
 
 ## メタデータのマッピング
 
@@ -43,6 +44,17 @@ khinsider のアルバムページにある情報ブロック（`Platforms:` / `
 - ID3 を読むには曲ごとに CDN への追加リクエスト（先頭数百KB〜数MBのレンジ取得）が必要です。100曲のアルバムを開くたびに100リクエストが増え、遅延・Cloudflare 負荷・CDN 転送量のいずれも見合いません。
 - khinsider の rip はタグが空、あるいは `Track 01` のままのものが珍しくなく、アルバムページの情報より信頼できるとは限りません。
 - `/rest/download` はファイルをそのまま返すので、タグを見たい場合はダウンロード後にクライアント側で扱えます。
+
+## 曲名検索
+
+`search2` / `search3` はアルバム名・publisher 名だけでなく **曲名**でも検索できます。曲名インデックス（`songs.tsv.gz` / 約33MB / 325万曲・10.5万アルバム）を khinsider-index の `song-index` リリースから初回起動時にバックグラウンドでダウンロードし、SQLite の FTS5（trigram トークナイザ）でローカルにビルドします。実装は `songs.py`。
+
+- ビルドが終わるまで曲検索は空を返します（アルバム・アーティスト検索は起動直後から使えます）。ビルドは4コア程度で30秒前後、DB は約600MB
+- trigram なので **部分一致と日本語**が効きます（`ノクターン` で `風のノクターン` もヒットする）。逆に3文字未満のクエリは扱えないため無視します
+- インデックスは候補アルバムを絞るためだけに使い、ヒットした曲は必ず実際のアルバムページ（30日キャッシュ）と突き合わせてから返します。曲名が一致しなければ曲番号で解決し、それでも合わなければその候補は捨てます。返る `id` は常に `getSong` / `stream` がそのまま扱えるものになります
+- 実サイト40アルバムでの実測では、インデックスの曲名は実際の表示名と95%前後（アルバム平均）一致し、曲番号フォールバックを含めて97%（2026年クロール分）/ 93%（2023年キャッシュ分）を解決できました
+- 1クエリで実ページを取得するアルバム数は `SONG_SEARCH_ALBUM_LIMIT`（既定12）まで。初回は1秒程度、ページがキャッシュ済みなら数十ms
+- 曲検索が不要なら `SONG_SEARCH=off` でダウンロードもビルドも行いません
 
 ## 起動
 
@@ -83,15 +95,23 @@ Subsonic API 互換クライアント（Symfonium / Tempo / DSub / Substreamer /
 | `GENRE_SOURCES` | `platform,album_type` | ジャンルに使う項目と順序。`album_type,platform` や `album_type` 単独も可 |
 | `ARTIST_MODE` | `auto` | `auto`（メタデータがあれば publisher）/ `publisher` / `letter` |
 | `FALLBACK_ARTIST` | `KHInsider` | publisher も developer も無い場合のアーティスト名 |
+| `SONG_SEARCH` | `auto` | `off` で曲名検索を無効化（インデックスのDLもビルドもしない） |
+| `SONGS_URL` | `.../releases/download/song-index/songs.tsv.gz` | 曲名インデックスの取得元 |
+| `SONGS_DB` | `./songs.sqlite` | ビルドした曲名DBの置き場所。約600MB使うので Docker では永続ボリューム推奨 |
+| `SONGS_MAX_AGE_DAYS` | `0` | 起動時、DBがこの日数より古ければ作り直す（`0` は作り直さない）。index 側は週次更新なので常設運用なら `7`〜`14` 程度 |
+| `SONG_SEARCH_ALBUM_LIMIT` | `12` | 1クエリで実ページを取得する候補アルバムの上限 |
+| `SONG_SEARCH_CANDIDATES` | `600` | インデックスから取り出す候補行の上限 |
 
 ## ライブラリデータ
 
-`library.json` は khinsider-index 側で生成します。
+`library.json` と `songs.tsv.gz` は khinsider-index 側で生成します。通常は同リポジトリの GitHub Actions（`album-meta.yaml` / `album-meta-residual.yaml` / `song-index.yaml`）が自動で回すので、手で叩く必要はありません。
 
 ```sh
 # khinsider-index リポジトリで
-python3 scripts/crawl_album_meta.py          # アルバムページのメタデータを収集（レジューム可）
-python3 scripts/build_library.py --gzip      # index.json とマージして library.json を生成
+python3 scripts/crawl_index_pages.py    # 一覧ページ210枚から全アルバムとメタデータを収集
+python3 scripts/crawl_facets.py         # publisher / developer / year の逆引きを収集
+python3 scripts/build_library.py --gzip # マージして library.json を生成
+python3 scripts/build_song_index.py     # 曲名インデックス songs.tsv.gz を生成
 ```
 
 スキーマ（メタデータ項目は無くても動作します）:
@@ -108,15 +128,18 @@ python3 scripts/build_library.py --gzip      # index.json とマージして lib
 
 メタデータが無い（旧形式の）library.json でも動きます。その場合はアルバムを開いた時点でページを取得して year / publisher / platform / album type を埋めるので、個々のアルバム表示は同じ結果になります。ただし `getAlbumList2?type=byGenre` / `byYear` / `newest` のような一覧系はライブラリ側の値を使うため、メタデータ入りの library.json が必要です。
 
+曲名インデックスは `album<TAB>disc<TAB>track<TAB>title` の gzip TSV です。曲名以外の情報（長さ・サイズ・実URL）は持たず、それらは常にアルバムページから取得します。
+
 ## 対応エンドポイント
 
 ping / getLicense / getUser / getMusicFolders / getOpenSubsonicExtensions / getIndexes / getArtists / getArtist / getArtistInfo / getArtistInfo2 / getMusicDirectory / getAlbum / getAlbumInfo / getAlbumInfo2 / getAlbumList / getAlbumList2 / getGenres / getSongsByGenre / search2 / search3 / getSong / getCoverArt / stream / download / scrobble / star / unstar / setRating / savePlayQueue / getStarred / getStarred2 / getPlaylists / getScanStatus
 
-- `search2` / `search3` の `song` は常に空です。曲名の全文検索には10万アルバム分のトラック一覧が必要で、index には入っていません（アルバム名・publisher名は検索できます）。
-- `getSongsByGenre` も同じ理由で空を返します。ジャンルはアルバム単位で `getAlbumList2?type=byGenre` を使ってください。
+- `search2` / `search3` はアルバム名・publisher 名・曲名を検索します。曲名側の仕組みと制限は「[曲名検索](#曲名検索)」を参照。
+- `getSongsByGenre` は空を返します。曲単位のジャンル閲覧には該当ジャンルの全アルバムページを取得する必要があるためです。ジャンルはアルバム単位で `getAlbumList2?type=byGenre` を使ってください。
 
 ## 注意点
 
-- ライブラリは 2026-09-01 時点のスナップショット。更新する場合は khinsider-index 側の `scripts/crawl_live.py`（アルバム一覧）と `scripts/crawl_album_meta.py`（メタデータ）で再クロールして library.json を差し替える
+- library.json は `LIBRARY_URL` から自動取得され、`LIBRARY_MAX_AGE_HOURS` を設定しておけば起動時に更新されます。index 側は日次でリリースを更新します
 - アルバム初回アクセス時は実ページ取得のため数百ms〜1秒程度の遅延あり（以後はキャッシュ）
+- 曲名DBのビルド中（初回起動から30秒前後）は曲検索だけが空を返します。ディスクは約600MB必要です
 - 外部公開する場合は HTTPS 化（Caddy等）と強いパスワードを推奨。Subsonic の legacy `p=` 認証は平文
