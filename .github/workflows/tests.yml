@@ -1,0 +1,30 @@
+name: Offline regression tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ['3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install -r requirements.txt pytest ruff httpx
+      - name: Compile and check fatal lint errors
+        run: |
+          python -m compileall -q server.py songs.py khinsider_player.py tests test_shared_player.py
+          ruff check --select E9,F63,F7,F82 server.py songs.py khinsider_player.py tests test_shared_player.py
+      - name: Offline tests
+        run: python -m pytest -q --import-mode=importlib

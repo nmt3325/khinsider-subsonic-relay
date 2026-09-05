@@ -13,6 +13,16 @@ downloads.khinsider.com の全アルバム（104,607件 / 2026-09-04時点）を
 3. `/rest/stream` は実ファイルの CDN URL へ 302 リダイレクト。リダイレクト非対応クライアント向けに `PROXY_STREAM=1` でサーバー中継モードも可
 4. 曲名検索用に、325万曲の曲名インデックスを別途ダウンロードしてローカルの SQLite FTS5 に展開（[曲名検索](#曲名検索)）
 
+### 追加取得を減らす経路
+
+- 対応しているアルバムでは、ページ内プレイヤーの実MP3 URLを曲の `songid` と結合します。MP3再生時に曲ごとのページ取得を省けます。JavaScriptは実行しません。
+- 未対応のプレイヤー形式・欠けたURL・FLAC等では実際の曲ページへフォールバックします。隣の曲のハッシュや拡張子からURLを推測しません。
+- 同一プロセス内の同じ取得はsingle-flightでまとめ、キャッシュファイルは一意な一時ファイルから置換します。
+- 曲索引はまず小さなmanifestを確認し、ソース・スキーマ・展開後内容が同じなら大きなgzip取得やFTS再構築を省きます。gzipのタイムスタンプだけが変わった場合も内容で判定します（明示的な期限再構築指定を除く）。
+- 破損・ハッシュ不一致・空の索引、不正なlibrary応答では最後に検証できたデータを維持します。初回移行時は索引を一度取り直すことがあります。
+
+データ形式と移行条件は [crawl contract](docs/crawl-contract.md) を参照してください。キャッシュ期限自体は従来どおりで、サイト側の変更を瞬時に検知する仕組みではありません。
+
 ## メタデータのマッピング
 
 khinsider のアルバムページにある情報ブロック（`Platforms:` / `Year:` / `Published by:` …）を Subsonic のタグへ変換します。
@@ -51,7 +61,7 @@ khinsider のアルバムページにある情報ブロック（`Platforms:` / `
 
 - ビルドが終わるまで曲検索は空を返します（アルバム・アーティスト検索は起動直後から使えます）。ビルドは4コア程度で30秒前後、DB は約600MB
 - trigram なので **部分一致と日本語**が効きます（`ノクターン` で `風のノクターン` もヒットする）。逆に3文字未満のクエリは扱えないため無視します
-- インデックスは候補アルバムを絞るためだけに使い、ヒットした曲は必ず実際のアルバムページ（30日キャッシュ）と突き合わせてから返します。曲名が一致しなければ曲番号で解決し、それでも合わなければその候補は捨てます。返る `id` は常に `getSong` / `stream` がそのまま扱えるものになります
+- インデックスは候補アルバムを絞るためだけに使い、ヒットした曲は必ず実際のアルバムページ（30日キャッシュ）と突き合わせてから返します。曲名が一致しなければディスク番号と曲番号で解決し、それでも合わなければその候補は捨てます。返る `id` は常に `getSong` / `stream` がそのまま扱えるものになります
 - 実サイト40アルバムでの実測では、インデックスの曲名は実際の表示名と95%前後（アルバム平均）一致し、曲番号フォールバックを含めて97%（2026年クロール分）/ 93%（2023年キャッシュ分）を解決できました
 - 1クエリで実ページを取得するアルバム数は `SONG_SEARCH_ALBUM_LIMIT`（既定12）まで。初回は1秒程度、ページがキャッシュ済みなら数十ms
 - 曲検索が不要なら `SONG_SEARCH=off` でダウンロードもビルドも行いません
@@ -64,7 +74,7 @@ Docker Compose:
 docker compose up -d
 ```
 
-同梱の `docker-compose.yml` は `khinsider-data` という named volume を `/data` にマウントし、library.json（約24MB）・曲名DB（約600MB）・ページキャッシュをまとめてそこに置きます。コンテナを作り直しても再ダウンロードや再ビルドは走りません。インデックス更新中は新旧2世代が一時的に並ぶので、1.5GB ほど空きを見てください。ホストから直接見えるディレクトリに置きたい場合は `volumes:` の指定を `- ./data:/data` に差し替えます。
+同梱の `docker-compose.yml` は `khinsider-data` という named volume を `/data` にマウントし、library.json（約24MB）・曲名DB（約600MB）・ページキャッシュをまとめてそこに置きます。コンテナを作り直しても通常は保存済みの索引を再利用します。データ・スキーマの更新や旧形式からの初回移行では再取得・再構築が必要になる場合があります。インデックス更新中は新旧2世代が一時的に並ぶので、1.5GB ほど空きを見てください。ホストから直接見えるディレクトリに置きたい場合は `volumes:` の指定を `- ./data:/data` に差し替えます。
 
 ベアメタル:
 
@@ -100,6 +110,7 @@ Subsonic API 互換クライアント（Symfonium / Tempo / DSub / Substreamer /
 | `FALLBACK_ARTIST` | `KHInsider` | publisher も developer も無い場合のアーティスト名 |
 | `SONG_SEARCH` | `auto` | `off` で曲名検索を無効化（インデックスのDLもビルドもしない） |
 | `SONGS_URL` | `.../releases/download/song-index/songs.tsv.gz` | 曲名インデックスの取得元 |
+| `SONGS_MANIFEST_URL` | 標準URLに対応する `songs-index.json` | 内容ハッシュの小さなmanifest。独自 `SONGS_URL` では明示指定したものだけを使用。空文字で無効化 |
 | `SONGS_DB` | `./songs.sqlite` | ビルドした曲名DBの置き場所。約600MB。Docker では `/data/songs.sqlite` |
 | `SONGS_REFRESH_HOURS` | `24` | 稼働中に曲名インデックスを再チェックする間隔（時間）。`0` で無効。中身が同じなら再ビルドせず、新しければ裏でビルドしてから原子的に差し替え |
 | `SONGS_MAX_AGE_DAYS` | `0` | 内容が変わっていなくても、DBがこの日数より古ければ作り直す（`0` は作り直さない） |
@@ -143,7 +154,17 @@ ping / getLicense / getUser / getMusicFolders / getOpenSubsonicExtensions / getI
 
 ## 注意点
 
-- library.json と曲名インデックスは稼働中も自動で更新されます。`LIBRARY_REFRESH_HOURS` / `SONGS_REFRESH_HOURS`（既定24時間）ごとに条件付き GET で確認し、中身が変わっていた時だけメモリ上のインデックスと曲名DBを差し替えるので、再起動もダウンタイムも不要です。index 側は library を日次、曲名インデックスを週次で更新します
+- library.json と曲名インデックスは稼働中も自動で更新されます。`LIBRARY_REFRESH_HOURS` / `SONGS_REFRESH_HOURS`（既定24時間）ごとに条件付き GET で確認し、中身が変わっていた時だけメモリ上のインデックスと曲名DBを差し替えるので、再起動もダウンタイムも不要です。index 側は library を日次、曲名インデックスを週次で確認し、内容に変更がある場合だけ公開します
 - アルバム初回アクセス時は実ページ取得のため数百ms〜1秒程度の遅延あり（以後はキャッシュ）
 - 曲名DBのビルド中（初回起動から30秒前後）は曲検索だけが空を返します。ディスクは約600MB、インデックス更新中は新旧2世代が並ぶため一時的に約1.2GB必要です
 - 外部公開する場合は HTTPS 化（Caddy等）と強いパスワードを推奨。Subsonic の legacy `p=` 認証は平文
+
+## オフライン回帰テスト
+
+```sh
+python -m pip install -r requirements.txt pytest ruff httpx
+python -m pytest -q --import-mode=importlib
+ruff check --select E9,F63,F7,F82 server.py songs.py khinsider_player.py tests test_shared_player.py
+```
+
+同梱のHTML断片とHTTPモックを使うため、テストに実クロールや音声ダウンロードは不要です。

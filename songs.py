@@ -13,14 +13,15 @@ expect.  If the index is missing, stale or broken, song search degrades to
 an empty list and the rest of the relay is unaffected.
 
 Upstream republishes the index weekly, so a background thread re-checks it
-every SONGS_REFRESH_HOURS.  The check is conditional (ETag / Last-Modified
-plus a content digest), so an unchanged index costs one HTTP 304 and
-nothing else.  A new index is built into a temporary file and swapped in
-atomically; queries keep hitting the old database until it is ready.
+every SONGS_REFRESH_HOURS.  The check is manifest-first when possible and
+otherwise falls back to a conditional gzip fetch.  A new index is built into
+a temporary file and swapped in atomically; queries keep hitting the old
+database until it is ready.
 """
 
 import gzip
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -29,9 +30,17 @@ import time
 import urllib.error
 import urllib.request
 
-SONGS_URL = os.environ.get('SONGS_URL') or (
+DEFAULT_SONGS_URL = (
     'https://github.com/nmt3325/khinsider-index/releases/download/'
     'song-index/songs.tsv.gz')
+DEFAULT_SONGS_MANIFEST_URL = (
+    'https://github.com/nmt3325/khinsider-index/releases/download/'
+    'song-index/songs-index.json')
+SONGS_URL = os.environ.get('SONGS_URL') or DEFAULT_SONGS_URL
+SONGS_MANIFEST_URL = os.environ.get('SONGS_MANIFEST_URL')
+if SONGS_MANIFEST_URL is None:
+    SONGS_MANIFEST_URL = (
+        DEFAULT_SONGS_MANIFEST_URL if SONGS_URL == DEFAULT_SONGS_URL else '')
 SONGS_DB = os.environ.get('SONGS_DB') or './songs.sqlite'
 SONGS_MAX_AGE_DAYS = float(os.environ.get('SONGS_MAX_AGE_DAYS') or 0)
 SONGS_REFRESH_HOURS = float(os.environ.get('SONGS_REFRESH_HOURS') or 24)
@@ -40,8 +49,10 @@ ALBUM_LIMIT = int(os.environ.get('SONG_SEARCH_ALBUM_LIMIT') or 12)
 CANDIDATES = int(os.environ.get('SONG_SEARCH_CANDIDATES') or 600)
 
 SCHEMA = 1
+TSV_SCHEMA = 1
 MIN_QUERY = 3  # the trigram tokenizer cannot match shorter needles
 USER_AGENT = 'khinsider-subsonic-relay'
+_HASH_RE = re.compile(r'^[0-9a-f]{64}$')
 
 _lock = threading.Lock()        # sqlite connections are not thread-safe
 _build_lock = threading.Lock()  # at most one download/build at a time
@@ -90,6 +101,135 @@ def _digest(path):
     return h.hexdigest()
 
 
+def _hash_hex(value):
+    s = str(value or '').strip().lower()
+    return s if _HASH_RE.match(s) else ''
+
+
+def _meta_path(db_path):
+    return 'file:%s?mode=ro' % db_path
+
+
+def _open_db(db_path, write=False):
+    uri = False
+    path = db_path
+    if not write:
+        uri = True
+        path = _meta_path(db_path)
+    return sqlite3.connect(path, uri=uri, check_same_thread=False)
+
+
+def _read_meta(db_path):
+    """Meta of the database currently on disk."""
+    if not os.path.exists(db_path):
+        return {}
+    try:
+        con = _open_db(db_path)
+        try:
+            return dict(con.execute('SELECT k, v FROM meta').fetchall())
+        finally:
+            con.close()
+    except Exception:
+        return {}
+
+
+def _meta_matches_runtime(meta):
+    return (int(meta.get('schema') or 0) == SCHEMA and
+            int(meta.get('tsv_schema') or 0) == TSV_SCHEMA and
+            meta.get('source') == SONGS_URL)
+
+
+def _trusted_meta(meta):
+    return _meta_matches_runtime(meta) and bool(_hash_hex(meta.get('content_digest')))
+
+
+def _needs_check(meta):
+    built = int(meta.get('built') or 0)
+    if SONGS_MAX_AGE_DAYS <= 0 or not built:
+        return False
+    return time.time() - built > SONGS_MAX_AGE_DAYS * 86400
+
+
+def _apply_state(meta):
+    if meta.get('rows'):
+        _state['rows'] = int(meta.get('rows') or 0)
+    if meta.get('built'):
+        _state['built'] = int(meta.get('built') or 0)
+    if meta.get('checked'):
+        _state['checked'] = int(meta.get('checked') or 0)
+
+
+def _write_meta(db_path, updates):
+    if not os.path.exists(db_path):
+        return False
+    try:
+        con = _open_db(db_path, write=True)
+        try:
+            con.execute('CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)')
+            rows = [(k, '' if v is None else str(v)) for k, v in updates.items()]
+            con.executemany('INSERT OR REPLACE INTO meta(k,v) VALUES (?,?)', rows)
+            con.commit()
+        finally:
+            con.close()
+        return True
+    except Exception:
+        return False
+
+
+def _usable(db_path, runtime_bound=False, apply_state=True):
+    """Open an existing database if it passes local schema checks."""
+    if not os.path.exists(db_path):
+        return None
+    try:
+        con = _open_db(db_path)
+        meta = dict(con.execute('SELECT k, v FROM meta').fetchall())
+        if int(meta.get('schema', 0)) != SCHEMA:
+            con.close()
+            return None
+        if runtime_bound and not _meta_matches_runtime(meta):
+            con.close()
+            return None
+        if apply_state:
+            _apply_state(meta)
+        return con
+    except Exception:
+        return None
+
+
+def _manifest_request(url):
+    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        raw = r.read()
+    data = json.loads(raw.decode('utf-8'))
+    if not isinstance(data, dict):
+        raise ValueError('manifest is not an object')
+    if int(data.get('schema_version') or 0) != TSV_SCHEMA:
+        raise ValueError('unexpected manifest schema')
+    manifest = {
+        'schema_version': TSV_SCHEMA,
+        'sha256': _hash_hex(data.get('sha256')),
+        'content_sha256': _hash_hex(data.get('content_sha256')),
+    }
+    if not manifest['sha256'] and not manifest['content_sha256']:
+        raise ValueError('manifest has no usable hashes')
+    return manifest
+
+
+def _load_manifest(url):
+    if not url:
+        return None
+    try:
+        return _manifest_request(url)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 410):
+            return None
+        print('song index: manifest fetch failed (%s)' % exc)
+        return None
+    except Exception as exc:
+        print('song index: manifest ignored (%s)' % exc)
+        return None
+
+
 def _download(url, dest, known=None):
     """Fetch url into dest. Returns (size, http-meta), or None if unchanged."""
     headers = {'User-Agent': USER_AGENT}
@@ -117,16 +257,93 @@ def _download(url, dest, known=None):
 
 def _rows(path):
     with gzip.open(path, 'rt', encoding='utf-8') as f:
-        for line in f:
-            p = line.rstrip('\n').split('\t')
-            if len(p) != 4 or not p[0] or not p[3]:
-                continue
-            yield (p[0], int(p[1]) if p[1] else None,
-                   int(p[2]) if p[2] else None, p[3])
+        for lineno, line in enumerate(f, 1):
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) != 4 or not parts[0] or not parts[3]:
+                raise ValueError('invalid TSV row %d' % lineno)
+            try:
+                disc = int(parts[1]) if parts[1] else None
+                num = int(parts[2]) if parts[2] else None
+            except ValueError:
+                raise ValueError('invalid TSV row %d' % lineno)
+            yield (parts[0], disc, num, parts[3])
 
 
-def _build(tsv_gz, db_path, http=None):
-    http = http or {}
+def _inspect_archive(path):
+    info = {'digest': _digest(path), 'content_digest': '', 'rows': 0}
+    h = hashlib.sha256()
+    with gzip.open(path, 'rb') as f:
+        for lineno, line in enumerate(f, 1):
+            h.update(line)
+            parts = line.rstrip(b'\n').split(b'\t')
+            if len(parts) != 4 or not parts[0] or not parts[3]:
+                raise ValueError('invalid TSV row %d' % lineno)
+            try:
+                if parts[1]:
+                    int(parts[1])
+                if parts[2]:
+                    int(parts[2])
+            except ValueError:
+                raise ValueError('invalid TSV row %d' % lineno)
+            info['rows'] += 1
+    if not info['rows']:
+        raise ValueError('empty TSV')
+    info['content_digest'] = h.hexdigest()
+    return info
+
+
+def _meta_updates(rows, http, archive, built=None, checked=None, manifest=None):
+    return {
+        'schema': SCHEMA,
+        'tsv_schema': TSV_SCHEMA,
+        'source': SONGS_URL,
+        'built': int(built or time.time()),
+        'checked': int(checked or time.time()),
+        'rows': int(rows),
+        'etag': http.get('etag') or '',
+        'last_modified': http.get('last_modified') or '',
+        'digest': archive.get('digest') or '',
+        'content_digest': archive.get('content_digest') or '',
+        'manifest_url': SONGS_MANIFEST_URL or '',
+        'manifest_sha256': (manifest or {}).get('sha256') or '',
+        'manifest_content_sha256': (manifest or {}).get('content_sha256') or '',
+    }
+
+
+def _touch_meta(meta, manifest=None):
+    if not meta:
+        return False
+    updates = {'checked': int(time.time())}
+    if manifest is not None:
+        updates['manifest_url'] = SONGS_MANIFEST_URL or ''
+        updates['manifest_sha256'] = manifest.get('sha256') or ''
+        updates['manifest_content_sha256'] = manifest.get('content_sha256') or ''
+    ok = _write_meta(SONGS_DB, updates)
+    if ok:
+        fresh = dict(meta)
+        fresh.update({k: str(v) for k, v in updates.items()})
+        _apply_state(fresh)
+    return ok
+
+
+def _swap_in(db_path):
+    global _conn
+    con = _usable(db_path)
+    if con is None:
+        _state['error'] = 'database rejected after build'
+        if _conn is None:
+            _state['state'] = 'error'
+        return False
+    with _lock:
+        old, _conn = _conn, con
+        _state['state'] = 'ready'
+        _state['error'] = None
+    if old is not None:
+        _retired.append(old)
+    return True
+
+
+def _build(tsv_gz, db_path, meta):
     tmp = db_path + '.building'
     for stale in (tmp, tmp + '-journal'):
         if os.path.exists(stale):
@@ -142,98 +359,70 @@ def _build(tsv_gz, db_path, http=None):
     con.execute('CREATE INDEX song_album ON song(album)')
     con.execute('CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT)')
     rows = con.execute('SELECT count(*) FROM song').fetchone()[0]
-    con.executemany('INSERT INTO meta(k,v) VALUES (?,?)', [
-        ('schema', str(SCHEMA)), ('source', SONGS_URL),
-        ('built', str(int(time.time()))), ('rows', str(rows)),
-        ('etag', http.get('etag') or ''),
-        ('last_modified', http.get('last_modified') or ''),
-        ('digest', http.get('digest') or '')])
+    if rows <= 0:
+        raise ValueError('empty TSV')
+    con.executemany('INSERT INTO meta(k,v) VALUES (?,?)',
+                    [(k, '' if v is None else str(v)) for k, v in meta.items()])
     con.commit()
     con.close()
     os.replace(tmp, db_path)
     return rows
 
 
-def _read_meta(db_path):
-    """Meta of the database currently on disk (etag / digest / built / rows)."""
-    if not os.path.exists(db_path):
-        return {}
-    try:
-        con = sqlite3.connect('file:%s?mode=ro' % db_path, uri=True)
-        try:
-            return dict(con.execute('SELECT k, v FROM meta').fetchall())
-        finally:
-            con.close()
-    except Exception:
-        return {}
-
-
-def _usable(db_path):
-    """Open an existing database if it matches the current schema and age."""
-    if not os.path.exists(db_path):
-        return None
-    try:
-        con = sqlite3.connect('file:%s?mode=ro' % db_path, uri=True, check_same_thread=False)
-        meta = dict(con.execute('SELECT k, v FROM meta').fetchall())
-        if int(meta.get('schema', 0)) != SCHEMA:
-            con.close()
-            return None
-        built = int(meta.get('built', 0))
-        if SONGS_MAX_AGE_DAYS and time.time() - built > SONGS_MAX_AGE_DAYS * 86400:
-            con.close()
-            return None
-        _state['rows'] = int(meta.get('rows', 0))
-        _state['built'] = built
-        return con
-    except Exception:
-        return None
-
-
-def _refresh(force=False):
-    """Download + rebuild when the published index changed.
-
-    The caller must hold _build_lock.  Returns True when a new database was
-    swapped in.  Nothing here can take a working index down: on any failure
-    the previous database keeps serving queries.
-    """
+def _sync(force=False):
+    """Shared startup/refresh path. Keeps the last-good DB on every failure."""
     global _conn
-    known = {} if force else _read_meta(SONGS_DB)
+    known = _read_meta(SONGS_DB)
+    manifest = _load_manifest(SONGS_MANIFEST_URL)
+    trusted = _trusted_meta(known)
+    checked = int(time.time())
+    _state['checked'] = checked
+    if manifest and trusted and manifest.get('content_sha256') == known.get('content_digest'):
+        if _usable(SONGS_DB) is not None:
+            _touch_meta(known, manifest)
+            _state['error'] = None
+            return False
+
     tmp = SONGS_DB + '.tsv.gz'
+    headers = known if trusted and not force else {}
     try:
         t0 = time.time()
-        got = _download(SONGS_URL, tmp, known)
+        got = _download(SONGS_URL, tmp, headers)
         _state['checked'] = int(time.time())
         if got is None:
-            return False                      # HTTP 304, nothing changed
+            _touch_meta(known, manifest)
+            _state['error'] = None
+            return False
         size, http = got
-        http['digest'] = _digest(tmp)
-        if not force and known.get('digest') == http['digest']:
-            return False                      # byte-identical, no rebuild
+        archive = _inspect_archive(tmp)
+        if manifest and manifest.get('sha256') and manifest['sha256'] != archive['digest']:
+            raise ValueError('gzip sha256 mismatch')
+        if (manifest and manifest.get('content_sha256') and
+                manifest['content_sha256'] != archive['content_digest']):
+            raise ValueError('content sha256 mismatch')
+        if trusted and archive['content_digest'] == known.get('content_digest'):
+            if _usable(SONGS_DB) is not None:
+                updates = _meta_updates(int(known.get('rows') or archive['rows']), http,
+                                        archive, built=int(known.get('built') or time.time()),
+                                        checked=int(time.time()), manifest=manifest)
+                _write_meta(SONGS_DB, updates)
+                _apply_state(_read_meta(SONGS_DB))
+                _state['error'] = None
+                return False
         _state['state'] = 'building' if _conn is None else 'refreshing'
         print('song index: downloaded %.1f MB in %.0fs' % (size / 1e6, time.time() - t0))
-        rows = _build(tmp, SONGS_DB, http)
+        rows = _build(tmp, SONGS_DB, _meta_updates(archive['rows'], http, archive,
+                                                   checked=int(time.time()),
+                                                   manifest=manifest))
         print('song index: built %d rows in %.0fs (%s)' % (
             rows, time.time() - t0, SONGS_DB))
+        return _swap_in(SONGS_DB)
     except Exception as exc:
         _note(exc)
         return False
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
-    con = _usable(SONGS_DB)
-    if con is None:
-        _state['error'] = 'database rejected after build'
-        if _conn is None:
-            _state['state'] = 'error'
-        return False
-    with _lock:
-        old, _conn = _conn, con
-        _state['state'] = 'ready'
-        _state['error'] = None
-    if old is not None:
-        # closed one cycle later, when no query can still be holding it
-        _retired.append(old)
-    return True
 
 
 def refresh(force=False):
@@ -243,11 +432,8 @@ def refresh(force=False):
     if not _build_lock.acquire(blocking=False):
         return False                          # a build is already running
     try:
-        if not force and SONGS_MAX_AGE_DAYS:
-            built = int(_read_meta(SONGS_DB).get('built') or 0)
-            if built and time.time() - built > SONGS_MAX_AGE_DAYS * 86400:
-                force = True
-        return _refresh(force=force)
+        meta = _read_meta(SONGS_DB)
+        return _sync(force=force or _needs_check(meta))
     finally:
         _build_lock.release()
 
@@ -273,15 +459,23 @@ def _ensure():
     if not _build_lock.acquire(blocking=False):
         return None    # first build in flight; song search stays empty for now
     try:
-        con = _usable(SONGS_DB)
-        if con is not None:
+        meta = _read_meta(SONGS_DB)
+        runtime_bound = _meta_matches_runtime(meta)
+        con = _usable(SONGS_DB, runtime_bound=runtime_bound, apply_state=runtime_bound)
+        if con is not None and runtime_bound:
             with _lock:
                 if _conn is None:
                     _conn = con
                     _state['state'] = 'ready'
                     _state['error'] = None
+                else:
+                    con.close()
+            if not _needs_check(meta):
                 return _conn
-        _refresh(force=True)
+        elif con is not None:
+            con.close()
+            con = None
+        _sync(force=(con is None) or _needs_check(meta))
     finally:
         _build_lock.release()
     with _lock:
@@ -365,15 +559,28 @@ def search(query, count=20, offset=0):
         album = server.load_album(slug)
         if not album or not album.get('tracks'):
             continue
-        by_title, by_num = {}, {}
+        by_title, by_disc_title, by_disc_num, by_num = {}, {}, {}, {}
         for i, t in enumerate(album['tracks'], 1):
-            by_title.setdefault(key(t.get('title')), i)
+            title_key = key(t.get('title'))
+            by_title.setdefault(title_key, []).append(i)
+            if t.get('disc'):
+                by_disc_title.setdefault((t['disc'], title_key), []).append(i)
             if t.get('num'):
                 by_num.setdefault(t['num'], i)
+                if t.get('disc'):
+                    by_disc_num.setdefault((t['disc'], t['num']), i)
         meta = server.album_meta(slug, album)
         seen = set()
         for disc, n, title in wanted[slug]:
-            idx = by_title.get(key(title))
+            idx = None
+            title_key = key(title)
+            matches = by_title.get(title_key) or []
+            if len(matches) == 1:
+                idx = matches[0]
+            elif disc and len(by_disc_title.get((disc, title_key)) or []) == 1:
+                idx = by_disc_title[(disc, title_key)][0]
+            if idx is None and disc and n:
+                idx = by_disc_num.get((disc, n))
             if idx is None and n:
                 idx = by_num.get(n)
             if idx is None or idx in seen:
