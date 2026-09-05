@@ -18,7 +18,8 @@ _PACKED = re.compile(
     r"\}\s*\(\s*(" + _STRING + r")\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*("
     + _STRING + r")\s*\.split\(\s*['\"]\|['\"]\s*\)", re.S)
 _SCRIPT = re.compile(r'<script\b[^>]*>(.*?)</script\s*>', re.S | re.I)
-_WORD = re.compile(r'\b[0-9A-Za-z]+\b')
+# JavaScript packer's word boundaries are ASCII, even beside Japanese text.
+_WORD = re.compile(r'\b[0-9A-Za-z]+\b', re.ASCII)
 _DIGITS = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
 
