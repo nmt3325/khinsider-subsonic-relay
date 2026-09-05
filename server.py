@@ -66,6 +66,14 @@ from curl_cffi import requests as creq
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 
+try:
+    import songs as song_index
+except Exception as _song_exc:  # the relay works fine without a song index
+    song_index = None
+    print('song index disabled: %s' % _song_exc)
+else:
+    song_index.start()
+
 BASE = 'https://downloads.khinsider.com'
 API_VERSION = '1.16.1'
 SERVER_TYPE = 'khinsider-relay'
@@ -1034,8 +1042,14 @@ async def subsonic(endpoint: str, request: Request):
                         artists.append({'id': aid, 'name': name, 'albumCount': count})
                         if len(artists) >= acount:
                             break
+        songs = []
+        if query and song_index is not None:
+            scount = max(0, _int(q, 'songCount', 20))
+            soffset = max(0, _int(q, 'songOffset', 0))
+            if scount:
+                songs = song_index.search(query, scount, soffset)
         key = 'searchResult2' if ep == 'search2' else 'searchResult3'
-        return respond({key: {'artist': artists, 'album': albums, 'song': []}}, fmt)
+        return respond({key: {'artist': artists, 'album': albums, 'song': songs}}, fmt)
 
     if ep == 'getSong':
         sid = q.get('id', '')
