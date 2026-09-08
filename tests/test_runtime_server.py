@@ -578,6 +578,61 @@ class RuntimeServerTests(unittest.TestCase):
             self.assertEqual([a['title'] for a in filtered['album']],
                              ['Soundtrack 03'])
             self.assertEqual(filtered['artist'], [])
+    def test_artist_entries_carry_artwork_and_every_album_artist_resolves(self):
+        """Strict clients need artwork fields and artistIds that really exist."""
+        library = {
+            'data_source': 'khinsider-live-v2',
+            'dataset_schema_version': 2,
+            'complete': True,
+            'legacy_inputs': [],
+            'albums': [
+                {'slug': 'album-a', 'title': 'Alpha Soundtrack',
+                 'publishers': ['Publisher A'], 'platforms': ['3DS']},
+                {'slug': 'album-b', 'title': 'Beta Soundtrack',
+                 'publishers': ['Publisher B'], 'platforms': ['3DS']},
+                {'slug': 'album-c', 'title': 'Gamma Soundtrack',
+                 'publishers': [], 'platforms': ['3DS']},
+            ],
+        }
+        mod = self.load_server(library=library)
+        creds = {'u': 'admin', 'p': 'admin', 'v': '1.16.1', 'c': 'test', 'f': 'json'}
+        fallback_id = mod.pub_id(mod.FALLBACK_ARTIST)
+        with TestClient(mod.app) as client:
+            def call(ep, **extra):
+                params = dict(creds)
+                params.update(extra)
+                response = client.get('/rest/%s.view' % ep, params=params)
+                self.assertEqual(response.status_code, 200)
+                return response.json()['subsonic-response']
+
+            index = call('getArtists')['artists']['index']
+            listed = [a for group in index for a in group['artist']]
+            result = call('search3', query='', artistCount=50, albumCount=50,
+                          songCount=0)['searchResult3']
+            self.assertEqual(len(listed), 3)
+            self.assertEqual(len(result['artist']), 3)
+            for artist in listed + result['artist']:
+                with self.subTest(artist=artist['name']):
+                    self.assertTrue(artist['coverArt'].startswith('album/'))
+                    self.assertTrue(artist['artistImageUrl'].startswith('http'))
+                    self.assertIn('id=album%2F', artist['artistImageUrl'])
+
+            artist_ids = {a['id'] for a in listed}
+            self.assertIn(fallback_id, artist_ids)
+            for album in result['album']:
+                with self.subTest(album=album['id']):
+                    self.assertIn(album['artistId'], artist_ids)
+
+            fallback = call('getArtist', id=fallback_id)['artist']
+            self.assertEqual(fallback['name'], mod.FALLBACK_ARTIST)
+            self.assertEqual([a['id'] for a in fallback['album']], ['album/album-c'])
+            self.assertTrue(fallback['coverArt'].startswith('album/'))
+
+            info = call('getArtistInfo2', id=fallback_id)['artistInfo2']
+            for key in ('smallImageUrl', 'mediumImageUrl', 'largeImageUrl'):
+                with self.subTest(key=key):
+                    self.assertTrue(info[key].startswith('http'))
+
 
 if __name__ == '__main__':
     unittest.main()
