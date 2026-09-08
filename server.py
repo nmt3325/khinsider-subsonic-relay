@@ -107,7 +107,7 @@ ARTIST_MODE = os.environ.get('ARTIST_MODE', 'auto').strip().lower()
 FALLBACK_ARTIST = os.environ.get('FALLBACK_ARTIST', 'KHInsider')
 
 # bump when the shape of a cached album changes so old caches are re-parsed
-ALBUM_CACHE_VERSION = 4
+ALBUM_CACHE_VERSION = 5
 
 AUDIO_EXT_RE = re.compile(r'\.(mp3|flac|ogg|m4a|opus|wma|wav)$', re.I)
 CONTENT_TYPES = {
@@ -848,11 +848,14 @@ def _parse_songlist(table, slug):
         if not cells:
             continue
         basename = None
+        add_to = tr.select_one('.playlistAddTo[songid]')
+        identified_track = add_to is not None and str(add_to.get('songid', '')).isdecimal()
         for a in tr.find_all('a', href=True):
-            href = urllib.parse.urlparse(a['href']).path
+            href = urllib.parse.urlsplit(a['href']).path
             parts = href.split('/')
             if (len(parts) == 5 and parts[1:3] == ['game-soundtracks', 'album']
-                    and urllib.parse.unquote(parts[3]) == wanted_slug and AUDIO_EXT_RE.search(href)):
+                    and urllib.parse.unquote(parts[3]) == wanted_slug and parts[4]
+                    and (AUDIO_EXT_RE.search(href) or identified_track)):
                 basename = urllib.parse.unquote(parts[4])
                 break
         if not basename:
@@ -934,6 +937,18 @@ def load_album(slug):
             return None
         if r.status_code != 200:
             return None
+        final = urllib.parse.urlsplit(getattr(r, 'url', None) or
+                                      '%s/game-soundtracks/album/%s' % (BASE, slug))
+        parts = final.path.rstrip('/').split('/')
+        if (final.scheme not in ('http', 'https')
+                or final.hostname != urllib.parse.urlsplit(BASE).hostname
+                or len(parts) != 4 or parts[:3] != ['', 'game-soundtracks', 'album']):
+            return None
+        decoded = urllib.parse.unquote(parts[3])
+        if (decoded in ('', '.', '..') or '/' in decoded or '\\' in decoded
+                or any(ord(char) < 32 or ord(char) == 127 for char in decoded)):
+            return None
+        resolved_slug = urllib.parse.quote(decoded, safe='')
         soup = BeautifulSoup(r.text, 'html.parser')
         h2 = soup.select_one('#pageContent h2')
         title = h2.get_text(' ', strip=True) if h2 else None
@@ -941,18 +956,19 @@ def load_album(slug):
             return None
         covers = _dedupe([a['href'] for a in soup.select('div.albumImage a[href]')])
         table = soup.select_one('table#songlist')
-        tracks = _parse_songlist(table, slug) if table else []
-        player_urls = extract_player_urls(r.text, slug)
+        tracks = _parse_songlist(table, resolved_slug) if table else []
+        player_urls = extract_player_urls(r.text, resolved_slug)
         if player_urls:
             for track in tracks:
                 songid = track.get('songid')
                 url = player_urls.get(songid) if songid else None
-                if url and valid_mp3_url(url, slug):
+                if url and valid_mp3_url(url, resolved_slug):
                     track['mp3_url'] = url
         alt = soup.select_one('p.albuminfoAlternativeTitles')
         album = {
             'v': ALBUM_CACHE_VERSION,
             'slug': slug,
+            'resolved_slug': resolved_slug,
             'title': title,
             'cover': covers[0] if covers else None,
             'covers': covers,
@@ -978,7 +994,7 @@ def _cached_direct_mp3(slug, basename):
         if track.get('basename') != basename:
             continue
         url = track.get('mp3_url')
-        if url and valid_mp3_url(url, slug):
+        if url and valid_mp3_url(url, album.get('resolved_slug') or slug):
             return {'files': {'mp3': url}}
         return None
     return None
@@ -995,8 +1011,13 @@ def _resolve_track_page(slug, basename):
         cached = _cache_get('tracks', key, max_age=30 * 86400)
         if cached:
             return cached
+        # Keep caller IDs/cache keys stable, but use an already confirmed
+        # redirect for network resolution. Do not add an album GET for FLAC.
+        album = _cache_get('albums', slug, max_age=30 * 86400)
+        target = (album.get('resolved_slug') or slug) if (
+            album and album.get('v') == ALBUM_CACHE_VERSION) else slug
         url = '%s/game-soundtracks/album/%s/%s' % (
-            BASE, slug, urllib.parse.quote(basename))
+            BASE, target, urllib.parse.quote(basename))
         try:
             r = sess.get(url, timeout=30)
         except Exception as exc:

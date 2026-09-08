@@ -311,5 +311,76 @@ class RuntimeServerTests(unittest.TestCase):
         self.assertEqual(len(module.ALBUMS), 1)
 
 
+    def test_cumulative_snapshot_with_pending_collection_is_served(self):
+        payload = {
+            'data_source': 'khinsider-live-v2', 'dataset_schema_version': 2,
+            'complete': True, 'legacy_inputs': [],
+            'completeness_scope': 'cumulative_snapshot', 'crawl_complete': False,
+            'coverage': {'pending': 1}, 'album_count': 1,
+            'albums': [{'slug': 'demo', 'title': 'Demo'}],
+        }
+        mod = self.load_server(payload)
+        client = TestClient(mod.app)
+        response = client.get('/rest/getAlbumList2', params={
+            'u': 'admin', 'p': 'admin', 'v': '1.16.1', 'c': 'test', 'f': 'json',
+            'type': 'alphabeticalByName', 'size': 10,
+        })
+        self.assertEqual(response.status_code, 200)
+        result = response.json()['subsonic-response']
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(result['albumList2']['album'][0]['name'], 'Demo')
+
+    def test_song_ids_preserve_observed_extensionless_and_truncated_basenames(self):
+        from bs4 import BeautifulSoup
+        for basename in ('long-filename.mp', 'long-filename-without-extension', 'a; b.mp3'):
+            with self.subTest(basename=basename):
+                mod = self.load_server()
+                soup = BeautifulSoup(self.album_html(title='Observed Track'), 'html.parser')
+                for link in soup.select('#songlist a[href]'):
+                    if '/game-soundtracks/album/demo/' in link['href']:
+                        link['href'] = '/game-soundtracks/album/demo/' + basename
+                fake = FakeSession({
+                    mod.BASE + '/game-soundtracks/album/demo': DummyResponse(text=str(soup)),
+                })
+                mod.sess = fake
+                album = mod.load_album('demo')
+                self.assertEqual(len(album['tracks']), 1)
+                self.assertEqual(album['tracks'][0]['basename'], basename)
+                self.assertEqual(album['tracks'][0]['title'], 'Observed Track')
+                self.assertEqual(len(fake.calls), 1)
+
+
+    def test_redirected_album_preserves_old_ids_and_resolves_canonical_media_paths(self):
+        mod = self.load_server()
+        mp3 = 'https://nu.vgmtreasurechest.com/soundtracks/canonical/hash/song.mp3'
+        flac = 'https://nu.vgmtreasurechest.com/soundtracks/canonical/hash/song.flac'
+        response = DummyResponse(text=self.album_html(
+            slug='canonical', basename='song.mp3', script=player_markup('1', mp3)))
+        response.url = mod.BASE + '/game-soundtracks/album/canonical'
+        old_url = mod.BASE + '/game-soundtracks/album/old-alias'
+        track_url = mod.BASE + '/game-soundtracks/album/canonical/song.mp3'
+        fake = FakeSession({old_url: response, track_url: DummyResponse(
+            text='<a href="' + flac + '"><span class="songDownloadLink">FLAC</span></a>')})
+        mod.sess = fake
+        album = mod.load_album('old-alias')
+        self.assertEqual(album['slug'], 'old-alias')
+        self.assertEqual(album['resolved_slug'], 'canonical')
+        self.assertEqual(mod.album_child('old-alias', album=album)['id'], 'album/old-alias')
+        self.assertEqual(mod.resolve_track('old-alias', 'song.mp3', requested_format='mp3')['files']['mp3'], mp3)
+        self.assertEqual(mod.resolve_track('old-alias', 'song.mp3', requested_format='flac')['files']['flac'], flac)
+        self.assertEqual(fake.calls, [old_url, track_url])
+
+    def test_non_album_redirects_are_not_cached_as_albums(self):
+        for final in ('https://downloads.khinsider.com/',
+                      'https://example.com/game-soundtracks/album/demo'):
+            with self.subTest(final=final):
+                mod = self.load_server()
+                response = DummyResponse(text=self.album_html())
+                response.url = final
+                mod.sess = FakeSession({mod.BASE + '/game-soundtracks/album/demo': response})
+                self.assertIsNone(mod.load_album('demo'))
+                self.assertIsNone(mod._cache_get('albums', 'demo', max_age=30 * 86400))
+
+
 if __name__ == '__main__':
     unittest.main()
