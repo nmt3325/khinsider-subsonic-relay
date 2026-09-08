@@ -47,6 +47,12 @@ Config (env):
                                        LIBRARY_REFRESH_HOURS)
   CACHE_DIR                          - page cache dir (default: ./cache)
   PROXY_STREAM                       - '1' to always proxy instead of 302
+  GZIP_MIN_SIZE                      - gzip API responses of at least this many
+                                       bytes (default 1024, negative disables
+                                       it); the artist index is ~1.5 MB of JSON
+                                       and ~0.3 MB gzipped, and clients reload
+                                       it on every library sync
+  GZIP_LEVEL                         - gzip level 1-9 (default 6)
   GENRE_SOURCES                      - which fields become genres, in order
                                        (default: platform,album_type)
   ARTIST_MODE                        - auto | publisher | letter (default auto):
@@ -61,6 +67,7 @@ Config (env):
 """
 import gzip
 import hashlib
+import inspect
 import json
 import os
 import random
@@ -102,6 +109,14 @@ LIBRARY_REFRESH_HOURS = float(os.environ.get('LIBRARY_REFRESH_HOURS', '24'))
 # older, startup-only spelling of the same knob
 LIBRARY_MAX_AGE_HOURS = float(os.environ.get('LIBRARY_MAX_AGE_HOURS', '0')) or LIBRARY_REFRESH_HOURS
 PROXY_STREAM = os.environ.get('PROXY_STREAM', '') == '1'
+try:
+    GZIP_MIN_SIZE = int(os.environ.get('GZIP_MIN_SIZE', '1024'))
+except ValueError:
+    GZIP_MIN_SIZE = 1024
+try:
+    GZIP_LEVEL = min(9, max(1, int(os.environ.get('GZIP_LEVEL', '6'))))
+except ValueError:
+    GZIP_LEVEL = 6
 GENRE_SOURCES = [s.strip().lower() for s in os.environ.get('GENRE_SOURCES', 'platform,album_type').split(',') if s.strip()]
 ARTIST_MODE = os.environ.get('ARTIST_MODE', 'auto').strip().lower()
 FALLBACK_ARTIST = os.environ.get('FALLBACK_ARTIST', 'KHInsider')
@@ -1186,7 +1201,49 @@ def song_child(slug, album_title, meta, t, idx, cover=None):
 
 # ALPHA_SLUGS / YEAR_SLUGS / NEWEST_SLUGS are (re)built by build_library_indexes()
 
+NO_GZIP_ENDPOINTS = frozenset({'stream', 'download', 'getcoverart', 'hls'})
+
+
+def gzip_exempt(path):
+    """True for media endpoints, whose bytes must reach the client untouched.
+
+    Audio and cover art are already compressed, and a ranged proxy response
+    has to arrive byte for byte. Current Starlette also skips audio/* by
+    content type, but deciding by endpoint keeps the behaviour identical on
+    the older releases requirements.txt still allows.
+    """
+    tail = path.rsplit('/', 1)[-1].casefold()
+    if tail.endswith('.view'):
+        tail = tail[:-len('.view')]
+    return tail in NO_GZIP_ENDPOINTS
+
+
+class RestGzipMiddleware:
+    """Gzip the API's JSON and XML responses.
+
+    A client that syncs a library re-downloads the whole artist and album
+    index, which is ~1.5 MB of JSON for this catalogue and ~0.3 MB gzipped.
+    """
+
+    def __init__(self, app, minimum_size=1024, compresslevel=6):
+        from starlette.middleware.gzip import GZipMiddleware
+        options = {'minimum_size': minimum_size}
+        params = inspect.signature(GZipMiddleware.__init__).parameters
+        if 'compresslevel' in params:
+            options['compresslevel'] = compresslevel
+        self.plain = app
+        self.compressed = GZipMiddleware(app, **options)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') != 'http' or gzip_exempt(scope.get('path', '')):
+            return await self.plain(scope, receive, send)
+        return await self.compressed(scope, receive, send)
+
+
 app = FastAPI()
+if GZIP_MIN_SIZE >= 0:
+    app.add_middleware(RestGzipMiddleware, minimum_size=GZIP_MIN_SIZE,
+                       compresslevel=GZIP_LEVEL)
 
 
 def _publisher_name(artist_id_):

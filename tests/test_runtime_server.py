@@ -468,6 +468,53 @@ class RuntimeServerTests(unittest.TestCase):
         letter = ok('getMusicDirectory', id='letter/H')['directory']
         self.assertEqual(titles(letter['child']), ['Handheld OST'])
 
+    def test_api_responses_are_gzipped_when_the_client_asks(self):
+        payload = {
+            'data_source': 'khinsider-live-v2', 'dataset_schema_version': 2,
+            'complete': True, 'legacy_inputs': [],
+            'albums': [
+                {'slug': 'album-%03d' % i, 'title': 'Soundtrack Number %03d' % i,
+                 'publishers': ['SEGA'], 'platforms': ['3DS']}
+                for i in range(80)
+            ],
+        }
+        mod = self.load_server(payload)
+        self.assertEqual(mod.GZIP_MIN_SIZE, 1024)
+        client = TestClient(mod.app)
+        creds = {'u': 'admin', 'p': 'admin', 'v': '1.16.1', 'c': 'test', 'f': 'json'}
+
+        def fetch(endpoint, accept_encoding, **params):
+            response = client.get('/rest/' + endpoint, params=dict(creds, **params),
+                                  headers={'Accept-Encoding': accept_encoding})
+            self.assertEqual(response.status_code, 200)
+            return response
+
+        compressed = fetch('getAlbumList2', 'gzip', type='alphabeticalByName', size=80)
+        plain = fetch('getAlbumList2', 'identity', type='alphabeticalByName', size=80)
+        self.assertEqual(compressed.headers.get('content-encoding'), 'gzip')
+        self.assertIsNone(plain.headers.get('content-encoding'))
+
+        # identical JSON either way; only the bytes on the wire shrink
+        self.assertEqual(compressed.json(), plain.json())
+        self.assertEqual(len(plain.json()['subsonic-response']['albumList2']['album']), 80)
+        on_the_wire = compressed.headers.get('content-length')
+        self.assertIsNotNone(on_the_wire)
+        self.assertLess(int(on_the_wire), len(plain.content))
+
+        # small replies are not worth compressing
+        small = fetch('ping', 'gzip')
+        self.assertLess(len(small.content), mod.GZIP_MIN_SIZE)
+        self.assertIsNone(small.headers.get('content-encoding'))
+
+        # media bytes must never be routed through the compressor
+        for path in ('/rest/stream', '/rest/stream.view', '/rest/download',
+                     '/rest/getCoverArt', '/rest/getCoverArt.view'):
+            with self.subTest(exempt=path):
+                self.assertTrue(mod.gzip_exempt(path))
+        for path in ('/', '/rest/getArtists', '/rest/getIndexes.view', '/rest/search3'):
+            with self.subTest(compressed=path):
+                self.assertFalse(mod.gzip_exempt(path))
+
 
 if __name__ == '__main__':
     unittest.main()
