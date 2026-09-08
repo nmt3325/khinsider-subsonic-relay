@@ -381,6 +381,93 @@ class RuntimeServerTests(unittest.TestCase):
                 self.assertIsNone(mod.load_album('demo'))
                 self.assertIsNone(mod._cache_get('albums', 'demo', max_age=30 * 86400))
 
+    def test_genre_browsing_accepts_client_recased_genre_names(self):
+        payload = {
+            'data_source': 'khinsider-live-v2', 'dataset_schema_version': 2,
+            'complete': True, 'legacy_inputs': [],
+            'albums': [
+                {'slug': 'handheld', 'title': 'Handheld OST', 'platforms': ['3DS']},
+                {'slug': 'console', 'title': 'Console OST', 'platforms': ['Wii U']},
+            ],
+        }
+        mod = self.load_server(payload)
+        client = TestClient(mod.app)
+        self.assertIn('3DS', mod.GENRE_ALBUMS)
+
+        def names_for(genre):
+            response = client.get('/rest/getAlbumList2', params={
+                'u': 'admin', 'p': 'admin', 'v': '1.16.1', 'c': 'test', 'f': 'json',
+                'type': 'byGenre', 'genre': genre, 'size': 10,
+            })
+            self.assertEqual(response.status_code, 200)
+            body = response.json()['subsonic-response']
+            self.assertEqual(body['status'], 'ok')
+            return [a['name'] for a in body.get('albumList2', {}).get('album', [])]
+
+        for spelling in ('3DS', '3Ds', '3ds', ' 3ds '):
+            with self.subTest(genre=spelling):
+                self.assertEqual(names_for(spelling), ['Handheld OST'])
+        self.assertEqual(names_for('wii u'), ['Console OST'])
+        self.assertEqual(names_for('Game Boy'), [])
+
+    def test_artist_browsing_is_available_in_both_browse_modes(self):
+        payload = {
+            'data_source': 'khinsider-live-v2', 'dataset_schema_version': 2,
+            'complete': True, 'legacy_inputs': [],
+            'albums': [
+                {'slug': 'handheld', 'title': 'Handheld OST',
+                 'publishers': ['SEGA'], 'platforms': ['3DS']},
+                {'slug': 'console', 'title': 'Console OST',
+                 'publishers': ['Sunsoft / Tokuma'], 'platforms': ['Wii U']},
+            ],
+        }
+        mod = self.load_server(payload)
+        client = TestClient(mod.app)
+        creds = {'u': 'admin', 'p': 'admin', 'v': '1.16.1', 'c': 'test', 'f': 'json'}
+
+        def ok(endpoint, **params):
+            response = client.get('/rest/' + endpoint, params=dict(creds, **params))
+            self.assertEqual(response.status_code, 200)
+            body = response.json()['subsonic-response']
+            self.assertEqual(body['status'], 'ok')
+            return body
+
+        def titles(rows):
+            return [row.get('name') or row.get('title') for row in rows]
+
+        self.assertTrue(mod.USE_PUB_ARTISTS)
+        groups = ok('getArtists')['artists']['index']
+        self.assertEqual(sorted(a['name'] for g in groups for a in g['artist']),
+                         ['SEGA', 'Sunsoft / Tokuma'])
+        # folder browsing must expose the artists too, not just A-Z buckets
+        self.assertEqual(ok('getIndexes')['indexes']['index'], groups)
+
+        for name, aid in {a['name']: a['id'] for g in groups for a in g['artist']}.items():
+            with self.subTest(artist=name):
+                artist = ok('getArtist', id=aid)['artist']
+                self.assertEqual(artist['name'], name)
+                self.assertEqual(len(artist['album']), 1)
+                directory = ok('getMusicDirectory', id=aid)['directory']
+                self.assertEqual(directory['name'], name)
+                self.assertEqual(len(directory['child']), 1)
+
+        for spelling in ('pub/SEGA', 'pub/sega', 'pub/Sega', 'pub/ sega '):
+            with self.subTest(artist_id=spelling):
+                artist = ok('getArtist', id=spelling)['artist']
+                self.assertEqual(artist['name'], 'SEGA')
+                self.assertEqual(titles(artist['album']), ['Handheld OST'])
+
+        quoted = 'pub/' + urllib.parse.quote('Sunsoft / Tokuma', safe='')
+        self.assertEqual(ok('getArtist', id=quoted)['artist']['name'], 'Sunsoft / Tokuma')
+        self.assertEqual(ok('getArtist', id='pub/sunsoft / tokuma')['artist']['name'],
+                         'Sunsoft / Tokuma')
+
+        missing = client.get('/rest/getArtist', params=dict(creds, id='pub/Nobody'))
+        self.assertEqual(missing.json()['subsonic-response']['status'], 'failed')
+
+        letter = ok('getMusicDirectory', id='letter/H')['directory']
+        self.assertEqual(titles(letter['child']), ['Handheld OST'])
+
 
 if __name__ == '__main__':
     unittest.main()
