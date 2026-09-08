@@ -216,6 +216,8 @@ def artist_id(meta):
         vals = meta.get(key) or []
         if vals and USE_PUB_ARTISTS:
             return pub_id(vals[0])
+    if USE_PUB_ARTISTS:
+        return pub_id(FALLBACK_ARTIST)
     if meta.get('letter'):
         return 'letter/' + meta['letter']
     return None
@@ -451,6 +453,7 @@ def build_library_indexes(lib):
     global LIB_META_ALBUMS, USE_PUB_ARTISTS, LIBRARY_BUILT
 
     albums, letter_albums, pub_albums, genre_albums, search = {}, {}, {}, {}, []
+    orphan_albums = []
     meta_albums = 0
     for a in lib['albums']:
         slug = a['slug']
@@ -460,8 +463,17 @@ def build_library_indexes(lib):
         search.append((meta['title'].lower(), slug))
         if meta['year'] or meta['publishers'] or meta['platforms'] or meta['album_type']:
             meta_albums += 1
-        for p in (meta['publishers'] or meta['developers']):
+        pubs = meta['publishers'] or meta['developers']
+        for p in pubs:
             pub_albums.setdefault(p, []).append((slug, meta['title']))
+        if not pubs:
+            orphan_albums.append((slug, meta['title']))
+    use_pub = ARTIST_MODE == 'publisher' or (ARTIST_MODE == 'auto' and bool(pub_albums))
+    if use_pub and orphan_albums:
+        # Without this bucket the 6%% of albums that carry no publisher point at
+        # an artist id that is not in getArtists/search3, and clients that join
+        # albums to artists drop them (or the whole artist view) on the floor.
+        pub_albums.setdefault(FALLBACK_ARTIST, []).extend(orphan_albums)
     for L in letter_albums:
         letter_albums[L].sort(key=lambda x: x[1].lower())
     for p in pub_albums:
@@ -489,7 +501,7 @@ def build_library_indexes(lib):
     LETTERS = letters
     PUBLISHERS = sorted(pub_albums.keys(), key=lambda s: s.lower())
     GENRES = sorted(genre_albums.keys(), key=lambda s: s.lower())
-    USE_PUB_ARTISTS = ARTIST_MODE == 'publisher' or (ARTIST_MODE == 'auto' and bool(pub_albums))
+    USE_PUB_ARTISTS = use_pub
     ALPHA_SLUGS = [slug for L in letters for slug, _ in letter_albums[L]]
     YEAR_SLUGS = sorted((s for s, m in albums.items() if m.get('year')),
                         key=lambda s: (albums[s]['year'], albums[s]['title'].lower()))
@@ -1277,12 +1289,58 @@ def _artist_entries():
     return [('letter/' + L, L, len(LETTER_ALBUMS[L])) for L in LETTERS]
 
 
-def _artist_index():
+def _artist_albums(artist_id_, name):
+    """Albums behind an artist entry, without re-decoding its id."""
+    if USE_PUB_ARTISTS:
+        return PUB_ALBUMS.get(name) or _albums_for_artist(artist_id_)
+    return LETTER_ALBUMS.get(name) or _albums_for_artist(artist_id_)
+
+
+def artist_child(artist_id_, name, count, image=None, albums=None):
+    """Artist entry as clients expect it: ArtistID3 plus artwork.
+
+    Clients decode the whole artist array with a single model, so artists
+    without artwork fields can be rejected wholesale - which shows up as a
+    completely empty artist list even though the response was HTTP 200.
+    The artist's first album supplies the cover.
+    """
+    d = {'id': artist_id_, 'name': name, 'albumCount': count}
+    rows = albums if albums is not None else _artist_albums(artist_id_, name)
+    if rows:
+        first = rows[0]
+        cover = 'album/' + (first[0] if isinstance(first, (list, tuple)) else first)
+        d['coverArt'] = cover
+        if image:
+            d['artistImageUrl'] = image(cover)
+    return d
+
+
+def _image_url(request, q):
+    """Absolute getCoverArt URL builder carrying the caller's own credentials."""
+    proto = (request.headers.get('x-forwarded-proto')
+             or request.url.scheme or 'https').split(',')[0].strip()
+    host = (request.headers.get('x-forwarded-host') or request.headers.get('host')
+            or request.url.netloc or '').split(',')[0].strip()
+    if not host:
+        return None
+    auth = {k: v for k, v in q.items() if k in ('u', 'p', 't', 's', 'v', 'c')}
+
+    def build(cover_id, size=600):
+        params = dict(auth)
+        params['id'] = cover_id
+        params['size'] = size
+        return '%s://%s/rest/getCoverArt.view?%s' % (
+            proto, host, urllib.parse.urlencode(params))
+
+    return build
+
+
+def _artist_index(image=None):
     """Alphabetical index groups shared by getArtists and getIndexes."""
     buckets = {}
     for aid, name, count in _artist_entries():
         buckets.setdefault(_derive_letter(name), []).append(
-            {'id': aid, 'name': name, 'albumCount': count})
+            artist_child(aid, name, count, image))
     return [{'name': L, 'artist': buckets[L]} for L in sorted(buckets.keys())]
 
 
@@ -1338,13 +1396,14 @@ async def subsonic(endpoint: str, request: Request):
         return respond({'indexes': {
             'lastModified': int(time.time() * 1000),
             'ignoredArticles': 'The El La Los Las Le Les',
-            'index': _artist_index(),
+            'index': _artist_index(_image_url(request, q)),
         }}, fmt)
 
     if ep == 'getArtists':
         # ID3 view: publishers become album artists when the library has them
         return respond({'artists': {
-            'ignoredArticles': 'The El La Los Las Le Les', 'index': _artist_index(),
+            'ignoredArticles': 'The El La Los Las Le Les',
+            'index': _artist_index(_image_url(request, q)),
         }}, fmt)
 
     if ep == 'getArtist':
@@ -1354,14 +1413,21 @@ async def subsonic(endpoint: str, request: Request):
             return sub_error(fmt, 70, 'Artist not found.')
         name = (_publisher_name(aid) if aid.startswith('pub/')
                 else urllib.parse.unquote(aid[len('letter/'):]))
-        return respond({'artist': {
-            'id': aid, 'name': name, 'albumCount': len(rows),
-            'album': [album_child(slug, parent=aid) for slug, _ in rows],
-        }}, fmt)
+        entry = artist_child(aid, name, len(rows), _image_url(request, q), albums=rows)
+        entry['album'] = [album_child(slug, parent=aid) for slug, _ in rows]
+        return respond({'artist': entry}, fmt)
 
     if ep == 'getArtistInfo' or ep == 'getArtistInfo2':
         key = 'artistInfo' if ep == 'getArtistInfo' else 'artistInfo2'
-        return respond({key: {}}, fmt)
+        rows = _albums_for_artist(q.get('id', ''))
+        info = {'biography': '', 'musicBrainzId': '', 'lastFmUrl': ''}
+        image = _image_url(request, q)
+        if rows and image:
+            cover = 'album/' + rows[0][0]
+            info['smallImageUrl'] = image(cover, 160)
+            info['mediumImageUrl'] = image(cover, 320)
+            info['largeImageUrl'] = image(cover, 600)
+        return respond({key: info}, fmt)
 
     if ep == 'getMusicDirectory':
         did = q.get('id', '')
@@ -1475,12 +1541,13 @@ async def subsonic(endpoint: str, request: Request):
         alcount = max(0, _int(q, 'albumCount', 20))
         aoffset = max(0, _int(q, 'albumOffset', 0))
         artists, albums = [], []
+        image = _image_url(request, q)
         if query:
             hits = [slug for title, slug in SEARCH if query in title]
             albums = [album_child(s) for s in hits[aoffset:aoffset + alcount]]
             if acount:
                 matches = [e for e in _artist_entries() if query in e[1].lower()]
-                artists = [{'id': aid, 'name': name, 'albumCount': count}
+                artists = [artist_child(aid, name, count, image)
                            for aid, name, count in matches[artoffset:artoffset + acount]]
         else:
             # An empty (or missing) query means "give me everything", paged by the
@@ -1488,7 +1555,7 @@ async def subsonic(endpoint: str, request: Request):
             # library through this branch instead of calling getArtists, so this
             # is what fills their artist and album lists.
             if acount:
-                artists = [{'id': aid, 'name': name, 'albumCount': count}
+                artists = [artist_child(aid, name, count, image)
                            for aid, name, count in
                            _artist_entries()[artoffset:artoffset + acount]]
             if alcount:
