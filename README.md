@@ -137,6 +137,8 @@ Subsonic API 互換クライアント（Symfonium / Tempo / DSub / Substreamer /
 | `LIBRARY_MAX_AGE_HOURS` | `LIBRARY_REFRESH_HOURS` | 起動時にキャッシュを再取得する古さのしきい値。旧来の名前で、通常は指定不要 |
 | `CACHE_DIR` | `./cache` | ページキャッシュ先（アルバム30日）。Docker では `/data/cache` |
 | `PROXY_STREAM` | - | `1` で302ではなくサーバー中継 |
+| `GZIP_MIN_SIZE` | `1024` | このバイト数以上のAPI応答をgzip圧縮（負値で無効）。アーティスト一覧は約1.5MB→約0.3MBになります。音声とジャケット画像は圧縮しません |
+| `GZIP_LEVEL` | `6` | gzip圧縮レベル 1-9 |
 | `GENRE_SOURCES` | `platform,album_type` | ジャンルに使う項目と順序。`album_type,platform` や `album_type` 単独も可 |
 | `ARTIST_MODE` | `auto` | `auto`（メタデータがあれば publisher）/ `publisher` / `letter` |
 | `FALLBACK_ARTIST` | `KHInsider` | publisher も developer も無い場合のアーティスト名 |
