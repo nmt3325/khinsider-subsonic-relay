@@ -162,6 +162,11 @@ def _dedupe(seq):
     return out
 
 
+def genre_key(name):
+    """Fold case and spacing so a client that re-cases a genre still matches."""
+    return ' '.join((name or '').split()).casefold()
+
+
 def genre_list(meta):
     """Map platform / album type (per GENRE_SOURCES) onto Subsonic genres."""
     out = []
@@ -404,7 +409,9 @@ def ensure_library():
 ALBUMS = {}          # slug -> metadata dict (title, letter, year, publishers, ...)
 LETTER_ALBUMS = {}   # letter -> [(slug, title)] sorted by title
 PUB_ALBUMS = {}      # publisher (or developer) -> [(slug, title)]
+PUB_LOOKUP = {}      # normalized publisher name -> the exact name used above
 GENRE_ALBUMS = {}    # genre name -> [slug]
+GENRE_LOOKUP = {}    # normalized genre name -> the exact name used above
 SEARCH = []          # (lower_title, slug)
 LETTERS = []
 PUBLISHERS = []
@@ -423,7 +430,8 @@ def build_library_indexes(lib):
     Everything is assembled into locals first and published in one go, so a
     background refresh can never expose half-built indexes to a request.
     """
-    global ALBUMS, LETTER_ALBUMS, PUB_ALBUMS, GENRE_ALBUMS, SEARCH, LETTERS
+    global ALBUMS, LETTER_ALBUMS, PUB_ALBUMS, PUB_LOOKUP, GENRE_ALBUMS, GENRE_LOOKUP
+    global SEARCH, LETTERS
     global PUBLISHERS, GENRES, ALPHA_SLUGS, YEAR_SLUGS, NEWEST_SLUGS
     global LIB_META_ALBUMS, USE_PUB_ARTISTS, LIBRARY_BUILT
 
@@ -451,8 +459,18 @@ def build_library_indexes(lib):
     for g in genre_albums:
         genre_albums[g].sort(key=lambda s: albums[s]['title'].lower())
 
+    genre_lookup = {}
+    for g in sorted(genre_albums, key=lambda s: s.lower()):
+        genre_lookup.setdefault(genre_key(g), g)
+
+    pub_lookup = {}
+    for p in sorted(pub_albums, key=lambda s: s.lower()):
+        pub_lookup.setdefault(genre_key(p), p)
+
     ALBUMS, LETTER_ALBUMS, PUB_ALBUMS, GENRE_ALBUMS, SEARCH = (
         albums, letter_albums, pub_albums, genre_albums, search)
+    GENRE_LOOKUP = genre_lookup
+    PUB_LOOKUP = pub_lookup
     LETTERS = letters
     PUBLISHERS = sorted(pub_albums.keys(), key=lambda s: s.lower())
     GENRES = sorted(genre_albums.keys(), key=lambda s: s.lower())
@@ -1171,11 +1189,27 @@ def song_child(slug, album_title, meta, t, idx, cover=None):
 app = FastAPI()
 
 
+def _publisher_name(artist_id_):
+    """Publisher name behind a pub/<name> id.
+
+    Clients re-case and re-encode ids, so exact hits are tried first and the
+    case/space-folded lookup only runs as a fallback.
+    """
+    raw = artist_id_[len('pub/'):] if artist_id_.startswith('pub/') else artist_id_
+    once = urllib.parse.unquote(raw)
+    twice = urllib.parse.unquote(once)
+    for name in (raw, once, twice):
+        if name in PUB_ALBUMS:
+            return name
+    return PUB_LOOKUP.get(genre_key(once), once)
+
+
 def _albums_for_artist(artist_id_):
     if artist_id_.startswith('letter/'):
-        return LETTER_ALBUMS.get(artist_id_[len('letter/'):], [])
+        letter = artist_id_[len('letter/'):]
+        return LETTER_ALBUMS.get(letter) or LETTER_ALBUMS.get(letter.upper(), [])
     if artist_id_.startswith('pub/'):
-        return PUB_ALBUMS.get(urllib.parse.unquote(artist_id_[len('pub/'):]), [])
+        return PUB_ALBUMS.get(_publisher_name(artist_id_), [])
     return []
 
 
@@ -1184,6 +1218,15 @@ def _artist_entries():
     if USE_PUB_ARTISTS:
         return [(pub_id(p), p, len(PUB_ALBUMS[p])) for p in PUBLISHERS]
     return [('letter/' + L, L, len(LETTER_ALBUMS[L])) for L in LETTERS]
+
+
+def _artist_index():
+    """Alphabetical index groups shared by getArtists and getIndexes."""
+    buckets = {}
+    for aid, name, count in _artist_entries():
+        buckets.setdefault(_derive_letter(name), []).append(
+            {'id': aid, 'name': name, 'albumCount': count})
+    return [{'name': L, 'artist': buckets[L]} for L in sorted(buckets.keys())]
 
 
 def _int(q, key, default=0):
@@ -1232,23 +1275,19 @@ async def subsonic(endpoint: str, request: Request):
         return respond({'musicFolders': {'musicFolder': [{'id': 0, 'name': 'KHInsider'}]}}, fmt)
 
     if ep == 'getIndexes':
-        # file/folder view: sections stay alphabetical
+        # folder view: the same browsable artists as the ID3 view, so a
+        # folder-mode client is not stuck with 27 alphabet buckets.
+        # letter/ ids stay valid in getMusicDirectory for old bookmarks.
         return respond({'indexes': {
             'lastModified': int(time.time() * 1000),
             'ignoredArticles': 'The El La Los Las Le Les',
-            'index': [{'name': L, 'artist': [{'id': 'letter/' + L, 'name': L,
-                                              'albumCount': len(LETTER_ALBUMS[L])}]} for L in LETTERS],
+            'index': _artist_index(),
         }}, fmt)
 
     if ep == 'getArtists':
         # ID3 view: publishers become album artists when the library has them
-        buckets = {}
-        for aid, name, count in _artist_entries():
-            buckets.setdefault(_derive_letter(name), []).append(
-                {'id': aid, 'name': name, 'albumCount': count})
-        index = [{'name': L, 'artist': buckets[L]} for L in sorted(buckets.keys())]
         return respond({'artists': {
-            'ignoredArticles': 'The El La Los Las Le Les', 'index': index,
+            'ignoredArticles': 'The El La Los Las Le Les', 'index': _artist_index(),
         }}, fmt)
 
     if ep == 'getArtist':
@@ -1256,8 +1295,8 @@ async def subsonic(endpoint: str, request: Request):
         rows = _albums_for_artist(aid)
         if not rows:
             return sub_error(fmt, 70, 'Artist not found.')
-        name = aid[len('pub/'):] if aid.startswith('pub/') else aid[len('letter/'):]
-        name = urllib.parse.unquote(name)
+        name = (_publisher_name(aid) if aid.startswith('pub/')
+                else urllib.parse.unquote(aid[len('letter/'):]))
         return respond({'artist': {
             'id': aid, 'name': name, 'albumCount': len(rows),
             'album': [album_child(slug, parent=aid) for slug, _ in rows],
@@ -1273,7 +1312,8 @@ async def subsonic(endpoint: str, request: Request):
             rows = _albums_for_artist(did)
             if not rows:
                 return sub_error(fmt, 70, 'Directory not found.')
-            name = urllib.parse.unquote(did.split('/', 1)[1])
+            name = (_publisher_name(did) if did.startswith('pub/')
+                    else urllib.parse.unquote(did.split('/', 1)[1]))
             return respond({'directory': {
                 'id': did, 'parent': '0', 'name': name,
                 'child': [album_child(slug, parent=did) for slug, _ in rows],
@@ -1334,7 +1374,10 @@ async def subsonic(endpoint: str, request: Request):
         offset = max(0, _int(q, 'offset', 0))
         slugs = None
         if kind == 'byGenre':
-            slugs = GENRE_ALBUMS.get(q.get('genre', ''), [])
+            name = q.get('genre', '')
+            if name not in GENRE_ALBUMS:
+                name = GENRE_LOOKUP.get(genre_key(name), name)
+            slugs = GENRE_ALBUMS.get(name, [])
         elif kind == 'byYear':
             fy, ty = _int(q, 'fromYear', 0), _int(q, 'toYear', 9999)
             lo, hi = min(fy, ty), max(fy, ty)
