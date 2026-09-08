@@ -516,5 +516,68 @@ class RuntimeServerTests(unittest.TestCase):
                 self.assertFalse(mod.gzip_exempt(path))
 
 
+    def test_empty_query_search3_lists_artists_and_albums_in_pages(self):
+        """Offline-first clients sync via search3 with an empty query."""
+        library = {
+            'data_source': 'khinsider-live-v2',
+            'dataset_schema_version': 2,
+            'complete': True,
+            'legacy_inputs': [],
+            'albums': [{'slug': 'album-%d' % i,
+                        'title': 'Soundtrack %02d' % i,
+                        'publishers': ['Publisher %02d' % i],
+                        'platforms': ['3DS']} for i in range(6)],
+        }
+        mod = self.load_server(library=library)
+        creds = {'u': 'admin', 'p': 'admin', 'v': '1.16.1', 'c': 'test', 'f': 'json'}
+        with TestClient(mod.app) as client:
+            def search(**extra):
+                params = dict(creds)
+                params.update(extra)
+                r = client.get('/rest/search3.view', params=params)
+                self.assertEqual(r.status_code, 200)
+                return r.json()['subsonic-response']['searchResult3']
+
+            first = search(query='', artistCount=4, artistOffset=0,
+                           albumCount=0, songCount=0)
+            second = search(query='', artistCount=4, artistOffset=4,
+                            albumCount=0, songCount=0)
+            self.assertEqual(len(first['artist']), 4)
+            self.assertEqual(len(second['artist']), 2)
+            names = [a['name'] for a in first['artist'] + second['artist']]
+            self.assertEqual(len(set(names)), 6)
+            self.assertEqual(names, sorted(names, key=str.lower))
+            for entry in first['artist']:
+                self.assertTrue(entry['id'].startswith('pub/'))
+                self.assertEqual(entry['albumCount'], 1)
+
+            detail = client.get('/rest/getArtist.view',
+                                params=dict(creds, id=first['artist'][0]['id']))
+            self.assertEqual(detail.status_code, 200)
+            self.assertEqual(detail.json()['subsonic-response']['artist']['name'],
+                             first['artist'][0]['name'])
+
+            page1 = search(query='', artistCount=0, albumCount=4,
+                           albumOffset=0, songCount=0)
+            page2 = search(query='', artistCount=0, albumCount=4,
+                           albumOffset=4, songCount=0)
+            titles = [a['title'] for a in page1['album'] + page2['album']]
+            self.assertEqual(len(titles), 6)
+            self.assertEqual(len(set(titles)), 6)
+            self.assertEqual(titles, sorted(titles, key=str.lower))
+
+            missing = search(artistCount=2, albumCount=2, songCount=0)
+            self.assertEqual(len(missing['artist']), 2)
+            self.assertEqual(len(missing['album']), 2)
+
+            no_songs = search(query='', artistCount=0, albumCount=0, songCount=50)
+            self.assertEqual(no_songs['song'], [])
+
+            filtered = search(query='Soundtrack 03', artistCount=5,
+                              albumCount=5, songCount=0)
+            self.assertEqual([a['title'] for a in filtered['album']],
+                             ['Soundtrack 03'])
+            self.assertEqual(filtered['artist'], [])
+
 if __name__ == '__main__':
     unittest.main()

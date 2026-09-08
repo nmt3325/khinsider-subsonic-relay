@@ -1471,6 +1471,7 @@ async def subsonic(endpoint: str, request: Request):
     if ep in ('search2', 'search3'):
         query = (q.get('query') or '').strip().strip('"').lower()
         acount = max(0, _int(q, 'artistCount', 20))
+        artoffset = max(0, _int(q, 'artistOffset', 0))
         alcount = max(0, _int(q, 'albumCount', 20))
         aoffset = max(0, _int(q, 'albumOffset', 0))
         artists, albums = [], []
@@ -1478,11 +1479,20 @@ async def subsonic(endpoint: str, request: Request):
             hits = [slug for title, slug in SEARCH if query in title]
             albums = [album_child(s) for s in hits[aoffset:aoffset + alcount]]
             if acount:
-                for aid, name, count in _artist_entries():
-                    if query in name.lower():
-                        artists.append({'id': aid, 'name': name, 'albumCount': count})
-                        if len(artists) >= acount:
-                            break
+                matches = [e for e in _artist_entries() if query in e[1].lower()]
+                artists = [{'id': aid, 'name': name, 'albumCount': count}
+                           for aid, name, count in matches[artoffset:artoffset + acount]]
+        else:
+            # An empty (or missing) query means "give me everything", paged by the
+            # count/offset parameters. Offline-first clients sync their whole
+            # library through this branch instead of calling getArtists, so this
+            # is what fills their artist and album lists.
+            if acount:
+                artists = [{'id': aid, 'name': name, 'albumCount': count}
+                           for aid, name, count in
+                           _artist_entries()[artoffset:artoffset + acount]]
+            if alcount:
+                albums = [album_child(s) for s in ALPHA_SLUGS[aoffset:aoffset + alcount]]
         songs = []
         if query and song_index is not None:
             scount = max(0, _int(q, 'songCount', 20))
