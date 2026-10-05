@@ -97,6 +97,7 @@ class RuntimeServerTests(unittest.TestCase):
         }), encoding='utf-8')
         os.environ['CACHE_DIR'] = str(cache_dir)
         os.environ['LIBRARY_PATH'] = str(library_path)
+        os.environ['PLAYLISTS_PATH'] = str(Path(tempdir.name) / 'playlists.json')
         os.environ['LIBRARY_URL'] = DEFAULT_LIBRARY_URL
         os.environ['LIBRARY_REFRESH_HOURS'] = '0'
         os.environ['LIBRARY_MAX_AGE_HOURS'] = '0'
@@ -632,6 +633,103 @@ class RuntimeServerTests(unittest.TestCase):
             for key in ('smallImageUrl', 'mediumImageUrl', 'largeImageUrl'):
                 with self.subTest(key=key):
                     self.assertTrue(info[key].startswith('http'))
+
+    def test_playlist_crud_persists_and_honours_repeated_song_parameters(self):
+        mod = self.load_server()
+        album = {
+            'title': 'Demo Album',
+            'tracks': [
+                {'title': 'One', 'basename': '01 One.mp3', 'formats': ['mp3'],
+                 'duration': 10, 'num': 1},
+                {'title': 'Two', 'basename': '02 Two.mp3', 'formats': ['mp3'],
+                 'duration': 20, 'num': 2},
+                {'title': 'Three', 'basename': '03 Three.mp3', 'formats': ['mp3'],
+                 'duration': 30, 'num': 3},
+            ],
+        }
+        mod.load_album = lambda slug: album if slug == 'demo' else None
+        creds = [('u', 'admin'), ('p', 'admin'), ('v', '1.16.1'),
+                 ('c', 'test'), ('f', 'json')]
+
+        with TestClient(mod.app) as client:
+            created = client.get('/rest/createPlaylist.view', params=creds + [
+                ('name', 'My Mix'),
+                ('songId', 'track/demo/1'),
+                ('songId', 'track/demo/2'),
+            ]).json()['subsonic-response']
+            self.assertEqual(created['status'], 'ok')
+            playlist = created['playlist']
+            self.assertEqual(playlist['name'], 'My Mix')
+            self.assertEqual(playlist['songCount'], 2)
+            self.assertEqual(playlist['duration'], 30)
+            self.assertEqual([entry['id'] for entry in playlist['entry']],
+                             ['track/demo/1', 'track/demo/2'])
+            playlist_id = playlist['id']
+
+            stored = json.loads(Path(mod.PLAYLISTS_PATH).read_text(encoding='utf-8'))
+            self.assertEqual(
+                [song['id'] for song in stored['playlists'][playlist_id]['songs']],
+                ['track/demo/1', 'track/demo/2'])
+
+            listed = client.get('/rest/getPlaylists.view', params=creds).json()
+            rows = listed['subsonic-response']['playlists']['playlist']
+            self.assertEqual([(row['id'], row['name']) for row in rows],
+                             [(playlist_id, 'My Mix')])
+
+            updated = client.get('/rest/updatePlaylist.view', params=creds + [
+                ('playlistId', playlist_id),
+                ('name', 'Road Trip'),
+                ('comment', 'offline favourites'),
+                ('public', 'true'),
+                ('songIndexToRemove', '0'),
+                ('songIdToAdd', 'track/demo/3'),
+            ]).json()['subsonic-response']
+            self.assertEqual(updated['status'], 'ok')
+
+            detail = client.get('/rest/getPlaylist.view',
+                                params=creds + [('id', playlist_id)]).json()
+            playlist = detail['subsonic-response']['playlist']
+            self.assertEqual(playlist['name'], 'Road Trip')
+            self.assertEqual(playlist['comment'], 'offline favourites')
+            self.assertTrue(playlist['public'])
+            self.assertEqual(playlist['duration'], 50)
+            self.assertEqual([entry['id'] for entry in playlist['entry']],
+                             ['track/demo/2', 'track/demo/3'])
+
+            replaced = client.get('/rest/createPlaylist.view', params=creds + [
+                ('playlistId', playlist_id),
+                ('songId', 'track/demo/3'),
+                ('songId', 'track/demo/1'),
+            ]).json()['subsonic-response']['playlist']
+            self.assertEqual([entry['id'] for entry in replaced['entry']],
+                             ['track/demo/3', 'track/demo/1'])
+
+            # POST form parameters use the same path as query parameters.
+            renamed = client.post('/rest/updatePlaylist.view', data=dict(creds + [
+                ('playlistId', playlist_id), ('name', 'POST Rename')
+            ])).json()['subsonic-response']
+            self.assertEqual(renamed['status'], 'ok')
+
+            # A second store instance proves the state is actually on disk.
+            from playlists import PlaylistStore
+            reopened = PlaylistStore(mod.PLAYLISTS_PATH, 'admin')
+            self.assertEqual(reopened.get(playlist_id)['name'], 'POST Rename')
+            self.assertEqual([song['id'] for song in reopened.get(playlist_id)['songs']],
+                             ['track/demo/3', 'track/demo/1'])
+
+            before = Path(mod.PLAYLISTS_PATH).read_text(encoding='utf-8')
+            missing = client.get('/rest/updatePlaylist.view', params=creds + [
+                ('playlistId', playlist_id), ('songIdToAdd', 'track/demo/99')
+            ]).json()['subsonic-response']
+            self.assertEqual(missing['status'], 'failed')
+            self.assertEqual(missing['error']['code'], 70)
+            self.assertEqual(Path(mod.PLAYLISTS_PATH).read_text(encoding='utf-8'), before)
+
+            deleted = client.get('/rest/deletePlaylist.view',
+                                 params=creds + [('id', playlist_id)]).json()
+            self.assertEqual(deleted['subsonic-response']['status'], 'ok')
+            empty = client.get('/rest/getPlaylists.view', params=creds).json()
+            self.assertEqual(empty['subsonic-response']['playlists']['playlist'], [])
 
 
 if __name__ == '__main__':

@@ -2,3 +2,4 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 curl_cffi>=0.7
 beautifulsoup4>=4.12
+python-multipart>=0.0.9

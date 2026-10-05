@@ -119,6 +119,10 @@ SUBSONIC_USER=myuser SUBSONIC_PASSWORD=secret uvicorn server:app --host 0.0.0.0 
 
 `GET /`（認証なし）でライブラリ件数・メタデータ付き件数・publisher 数・ジャンル数・現在のモードに加え、library と曲名インデックスの取得状況（`library` / `songIndex`）を確認できます。
 
+## プレイリスト
+
+Subsonic の `getPlaylists` / `getPlaylist` / `createPlaylist` / `updatePlaylist` / `deletePlaylist` に対応しています。プレイリストは JSON で永続化され、Docker では既定で `/data/playlists.json` に保存されるため、コンテナを再作成しても残ります。曲の追加・削除・並び順、名前、コメント、public フラグを保持します。
+
 ## クライアント設定
 
 Subsonic API 互換クライアント（Symfonium / Tempo / DSub / Substreamer / play:Sub / Ultrasonic など）で:
@@ -138,6 +142,7 @@ Subsonic API 互換クライアント（Symfonium / Tempo / DSub / Substreamer /
 | `LIBRARY_REFRESH_HOURS` | `24` | 稼働中に library.json を再チェックする間隔（時間）。`0` で無効。ETag / Last-Modified 付きの条件付き GET なので、更新が無ければ 304 が返るだけで再構築もしません |
 | `LIBRARY_MAX_AGE_HOURS` | `LIBRARY_REFRESH_HOURS` | 起動時にキャッシュを再取得する古さのしきい値。旧来の名前で、通常は指定不要 |
 | `CACHE_DIR` | `./cache` | ページキャッシュ先（アルバム30日）。Docker では `/data/cache` |
+| `PLAYLISTS_PATH` | `library.json` と同じディレクトリの `playlists.json` | プレイリスト永続化ファイル。Docker では `/data/playlists.json` |
 | `PROXY_STREAM` | - | `1` で302ではなくサーバー中継 |
 | `GZIP_MIN_SIZE` | `1024` | このバイト数以上のAPI応答をgzip圧縮（負値で無効）。アーティスト一覧は約1.5MB→約0.3MBになります。音声とジャケット画像は圧縮しません |
 | `GZIP_LEVEL` | `6` | gzip圧縮レベル 1-9 |
@@ -183,7 +188,7 @@ python3 scripts/build_song_index.py     # 曲名インデックス songs.tsv.gz 
 
 ## 対応エンドポイント
 
-ping / getLicense / getUser / getMusicFolders / getOpenSubsonicExtensions / getIndexes / getArtists / getArtist / getArtistInfo / getArtistInfo2 / getMusicDirectory / getAlbum / getAlbumInfo / getAlbumInfo2 / getAlbumList / getAlbumList2 / getGenres / getSongsByGenre / search2 / search3 / getSong / getCoverArt / stream / download / scrobble / star / unstar / setRating / savePlayQueue / getStarred / getStarred2 / getPlaylists / getScanStatus
+ping / getLicense / getUser / getMusicFolders / getOpenSubsonicExtensions / getIndexes / getArtists / getArtist / getArtistInfo / getArtistInfo2 / getMusicDirectory / getAlbum / getAlbumInfo / getAlbumInfo2 / getAlbumList / getAlbumList2 / getGenres / getSongsByGenre / search2 / search3 / getSong / getCoverArt / stream / download / getPlaylists / getPlaylist / createPlaylist / updatePlaylist / deletePlaylist / scrobble / star / unstar / setRating / savePlayQueue / getStarred / getStarred2 / getScanStatus
 
 - `search2` / `search3` はアルバム名・publisher 名・曲名を検索します。曲名側の仕組みと制限は「[曲名検索](#曲名検索)」を参照。
 - `getSongsByGenre` は空を返します。曲単位のジャンル閲覧には該当ジャンルの全アルバムページを取得する必要があるためです。ジャンルはアルバム単位で `getAlbumList2?type=byGenre` を使ってください。

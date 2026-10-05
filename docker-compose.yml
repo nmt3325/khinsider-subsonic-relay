@@ -8,6 +8,7 @@ services:
       SUBSONIC_PASSWORD: change-me
       # 永続化先（Dockerfile の既定値と同じだが、明示しておく）
       LIBRARY_PATH: /data/library.json
+      PLAYLISTS_PATH: /data/playlists.json
       CACHE_DIR: /data/cache
       SONGS_DB: /data/songs.sqlite
       # index の自動更新。起動時だけでなく、稼働中も定期的に再チェックする（0 で無効）

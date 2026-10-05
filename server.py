@@ -85,6 +85,7 @@ from curl_cffi import requests as creq
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from khinsider_player import extract_player_urls, valid_mp3_url
+from playlists import PlaylistStore
 from search_utils import normalize_text, rank_normalized, rank_text
 
 try:
@@ -98,11 +99,13 @@ else:
 BASE = 'https://downloads.khinsider.com'
 API_VERSION = '1.16.1'
 SERVER_TYPE = 'khinsider-relay'
-SERVER_VERSION = '0.3.0'
+SERVER_VERSION = '0.4.0'
 USERNAME = os.environ.get('SUBSONIC_USER', 'admin')
 PASSWORD = os.environ.get('SUBSONIC_PASSWORD', 'admin')
 CACHE_DIR = os.environ.get('CACHE_DIR', './cache')
 LIBRARY_PATH = os.environ.get('LIBRARY_PATH', './library.json')
+PLAYLISTS_PATH = os.environ.get('PLAYLISTS_PATH') or os.path.join(
+    os.path.dirname(LIBRARY_PATH) or '.', 'playlists.json')
 LIBRARY_URL = os.environ.get(
     'LIBRARY_URL',
     'https://github.com/nmt3325/khinsider-index/releases/latest/download/library.json')
@@ -140,6 +143,7 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(os.path.join(CACHE_DIR, 'albums'), exist_ok=True)
 os.makedirs(os.path.join(CACHE_DIR, 'tracks'), exist_ok=True)
 
+playlist_store = PlaylistStore(PLAYLISTS_PATH, USERNAME)
 sess = creq.Session(impersonate='chrome')
 
 # ---------------- metadata helpers ----------------
@@ -1212,6 +1216,75 @@ def song_child(slug, album_title, meta, t, idx, cover=None):
     d['path'] = '%s/%s/%s' % (_sanitize(d['artist']), _sanitize(album_title), _sanitize(t['basename']))
     return d
 
+
+def _song_by_id(song_id):
+    m = re.match(r'^track/(.+)/(\d+)$', str(song_id or ''))
+    if not m:
+        return None
+    slug, idx = m.group(1), int(m.group(2))
+    album = load_album(slug)
+    if not album or idx < 1 or idx > len(album.get('tracks') or []):
+        return None
+    meta = album_meta(slug, album)
+    return song_child(slug, album['title'], meta, album['tracks'][idx - 1], idx)
+
+
+def _playlist_stored_song(song_id):
+    song = _song_by_id(song_id)
+    if song is None:
+        return None
+    return {
+        'id': song['id'],
+        'duration': int(song.get('duration') or 0),
+        'coverArt': song.get('coverArt'),
+    }
+
+
+def _playlist_summary(row):
+    songs = row.get('songs') or []
+    out = {
+        'id': row['id'],
+        'name': row['name'],
+        'owner': row.get('owner') or USERNAME,
+        'public': bool(row.get('public')),
+        'songCount': len(songs),
+        'duration': sum(int(song.get('duration') or 0) for song in songs),
+        'created': row.get('created'),
+        'changed': row.get('changed'),
+    }
+    if row.get('comment'):
+        out['comment'] = row['comment']
+    if songs and songs[0].get('coverArt'):
+        out['coverArt'] = songs[0]['coverArt']
+    return out
+
+
+def _playlist_with_entries(row):
+    out = _playlist_summary(row)
+    entries = []
+    for stored in row.get('songs') or []:
+        song = _song_by_id(stored.get('id'))
+        if song is not None:
+            entries.append(song)
+    out['entry'] = entries
+    out['songCount'] = len(entries)
+    out['duration'] = sum(int(song.get('duration') or 0) for song in entries)
+    if entries:
+        out['coverArt'] = entries[0].get('coverArt')
+    return out
+
+
+def _bool_param(value):
+    if value is None:
+        return None
+    text = str(value).strip().casefold()
+    if text in ('1', 'true', 'yes', 'on'):
+        return True
+    if text in ('0', 'false', 'no', 'off'):
+        return False
+    raise ValueError('Invalid boolean value.')
+
+
 # ALPHA_SLUGS / YEAR_SLUGS / NEWEST_SLUGS are (re)built by build_library_indexes()
 
 NO_GZIP_ENDPOINTS = frozenset({'stream', 'download', 'getcoverart', 'hls'})
@@ -1356,10 +1429,14 @@ def _int(q, key, default=0):
 @app.post('/rest/{endpoint}')
 async def subsonic(endpoint: str, request: Request):
     q = dict(request.query_params)
+    multi = {}
+    for k, v in request.query_params.multi_items():
+        multi.setdefault(k, []).append(str(v))
     if request.method == 'POST':
         try:
             form = await request.form()
-            for k, v in form.items():
+            for k, v in form.multi_items():
+                multi.setdefault(k, []).append(str(v))
                 q.setdefault(k, str(v))
         except Exception:
             pass
@@ -1583,18 +1660,98 @@ async def subsonic(endpoint: str, request: Request):
         key = 'searchResult2' if ep == 'search2' else 'searchResult3'
         return respond({key: {'artist': artists, 'album': albums, 'song': songs}}, fmt)
 
+    if ep == 'getPlaylists':
+        requested_user = q.get('username')
+        if requested_user and requested_user != USERNAME:
+            return sub_error(fmt, 50, 'Not authorized to list another user\'s playlists.')
+        rows = [_playlist_summary(row) for row in playlist_store.list()]
+        return respond({'playlists': {'playlist': rows}}, fmt)
+
+    if ep == 'getPlaylist':
+        playlist_id = q.get('id')
+        if not playlist_id:
+            return sub_error(fmt, 10, 'Required parameter id is missing.')
+        row = playlist_store.get(playlist_id)
+        if row is None:
+            return sub_error(fmt, 70, 'Playlist not found.')
+        return respond({'playlist': _playlist_with_entries(row)}, fmt)
+
+    if ep == 'createPlaylist':
+        playlist_id = q.get('playlistId')
+        song_ids = multi.get('songId', [])
+        stored_songs = []
+        for song_id in song_ids:
+            stored = _playlist_stored_song(song_id)
+            if stored is None:
+                return sub_error(fmt, 70, 'Song not found: %s' % song_id)
+            stored_songs.append(stored)
+
+        try:
+            if playlist_id:
+                current = playlist_store.get(playlist_id)
+                if current is None:
+                    return sub_error(fmt, 70, 'Playlist not found.')
+                if current.get('owner') != USERNAME:
+                    return sub_error(fmt, 50, 'Not authorized to update this playlist.')
+                row = playlist_store.replace(
+                    playlist_id,
+                    name=q.get('name') if 'name' in q else None,
+                    songs=stored_songs)
+            else:
+                if not (q.get('name') or '').strip():
+                    return sub_error(fmt, 10, 'Required parameter name is missing.')
+                row = playlist_store.create(q['name'], stored_songs)
+        except ValueError as exc:
+            return sub_error(fmt, 0, str(exc))
+        return respond({'playlist': _playlist_with_entries(row)}, fmt)
+
+    if ep == 'updatePlaylist':
+        playlist_id = q.get('playlistId')
+        if not playlist_id:
+            return sub_error(fmt, 10, 'Required parameter playlistId is missing.')
+        current = playlist_store.get(playlist_id)
+        if current is None:
+            return sub_error(fmt, 70, 'Playlist not found.')
+        if current.get('owner') != USERNAME:
+            return sub_error(fmt, 50, 'Not authorized to update this playlist.')
+
+        add_songs = []
+        for song_id in multi.get('songIdToAdd', []):
+            stored = _playlist_stored_song(song_id)
+            if stored is None:
+                return sub_error(fmt, 70, 'Song not found: %s' % song_id)
+            add_songs.append(stored)
+        try:
+            remove_indexes = [int(value) for value in multi.get('songIndexToRemove', [])]
+            public = _bool_param(q.get('public')) if 'public' in q else None
+            playlist_store.update(
+                playlist_id,
+                name=q.get('name') if 'name' in q else None,
+                comment=q.get('comment') if 'comment' in q else None,
+                public=public,
+                add_songs=add_songs,
+                remove_indexes=remove_indexes)
+        except (ValueError, IndexError) as exc:
+            return sub_error(fmt, 0, str(exc))
+        return respond({}, fmt)
+
+    if ep == 'deletePlaylist':
+        playlist_id = q.get('id')
+        if not playlist_id:
+            return sub_error(fmt, 10, 'Required parameter id is missing.')
+        current = playlist_store.get(playlist_id)
+        if current is None:
+            return sub_error(fmt, 70, 'Playlist not found.')
+        if current.get('owner') != USERNAME:
+            return sub_error(fmt, 50, 'Not authorized to delete this playlist.')
+        playlist_store.delete(playlist_id)
+        return respond({}, fmt)
+
     if ep == 'getSong':
-        sid = q.get('id', '')
-        m = re.match(r'^track/(.+)/(\d+)$', sid)
-        if not m:
+        song = _song_by_id(q.get('id'))
+        if song is None:
             return sub_error(fmt, 70, 'Song not found.')
-        slug, idx = m.group(1), int(m.group(2))
-        album = load_album(slug)
-        if not album or idx < 1 or idx > len(album['tracks']):
-            return sub_error(fmt, 70, 'Song not found.')
-        meta = album_meta(slug, album)
-        return respond({'song': song_child(slug, album['title'], meta,
-                                          album['tracks'][idx - 1], idx)}, fmt)
+        return respond({'song': song}, fmt)
 
     if ep == 'getCoverArt':
         cid = q.get('id', '')
@@ -1651,9 +1808,6 @@ async def subsonic(endpoint: str, request: Request):
     if ep in ('getStarred', 'getStarred2'):
         key = 'starred' if ep == 'getStarred' else 'starred2'
         return respond({key: {'artist': [], 'album': [], 'song': []}}, fmt)
-
-    if ep == 'getPlaylists':
-        return respond({'playlists': {'playlist': []}}, fmt)
 
     if ep == 'getScanStatus':
         return respond({'scanStatus': {'scanning': False, 'count': len(ALBUMS)}}, fmt)

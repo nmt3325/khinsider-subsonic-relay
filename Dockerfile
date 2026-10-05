@@ -5,14 +5,15 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py songs.py search_utils.py khinsider_player.py ./
+COPY server.py songs.py playlists.py search_utils.py khinsider_player.py ./
 
-# /data is the only writable state: library.json, the song index and the
-# album page cache. Mount a volume there or everything is rebuilt on
+# /data is the only writable state: library.json, the song index, playlists and
+# the album page cache. Mount a volume there or everything is rebuilt on
 # every container start (24MB + 33MB of downloads and a ~30s index build).
 ENV PORT=8080 \
     CACHE_DIR=/data/cache \
     LIBRARY_PATH=/data/library.json \
+    PLAYLISTS_PATH=/data/playlists.json \
     SONGS_DB=/data/songs.sqlite
 
 VOLUME /data
