@@ -23,6 +23,7 @@ def build_fixture_db(mod, tmp_path):
         ('mario', 1, 2, 'Super Mario Odyssey'),
         ('ski', 1, 1, 'Ski Safari Theme'),
         ('other', 1, 1, 'Jumping Superstar'),
+        ('other', 1, 2, 'Jump up Superstar'),
         ('jp', 1, 1, '風のノクターン ～夜想曲～'),
         ('width', 1, 1, 'ＳＵＰＥＲ　ＭＡＲＩＯ'),
     ]
@@ -68,7 +69,9 @@ def test_song_search_handles_gaps_joined_words_unicode_and_typo(monkeypatch, tmp
 def test_short_words_are_checked_as_words_not_inside_other_words(monkeypatch, tmp_path):
     mod = build_fixture_db(load_songs(tmp_path, monkeypatch), tmp_path)
     found = titles(mod, 'jump up star')
-    assert 'Jump Up, Super Star!' in found
+    assert found[0] == 'Jump Up, Super Star!'
+    assert 'Jump up Superstar' in found
+    assert found.index('Jump Up, Super Star!') < found.index('Jump up Superstar')
     assert 'Jumping Superstar' not in found
 
 

@@ -75,55 +75,77 @@ def rank_normalized(qnorm, tnorm, allow_fuzzy=True):
         return (2, len(tnorm))
     if qnorm in tnorm:
         return (3, len(tnorm))
-    if len(qcompact) >= 3 and qcompact in tcompact:
-        return (4, len(tnorm))
 
     qterms = qnorm.split()
     tterms = tnorm.split()
     positions = []
     missing = []
     exact = 0
+    partial = 0
     cursor = 0
+
     for term in qterms:
-        if _short_ascii_term(term):
-            try:
-                token_index = tterms.index(term)
-            except ValueError:
-                missing.append(term)
-                continue
-            pos = tnorm.find(term, cursor)
-            if pos < 0:
-                pos = tnorm.find(term)
-        else:
-            pos = tnorm.find(term, cursor)
-            if pos < 0:
-                pos = tnorm.find(term)
-            if pos < 0:
-                missing.append(term)
-                continue
-        exact += 1
-        positions.append(pos)
-        cursor = max(cursor, pos + len(term))
+        match_index = None
+        for i in range(cursor, len(tterms)):
+            if tterms[i] == term:
+                match_index = i
+                break
+        if match_index is None:
+            for i, token in enumerate(tterms):
+                if token == term:
+                    match_index = i
+                    break
+        if match_index is not None:
+            exact += 1
+            positions.append(match_index)
+            cursor = match_index + 1
+            continue
 
-    fuzzy = False
-    if missing:
-        if not (allow_fuzzy and len(missing) == 1 and exact >= 1):
-            return None
-        needle = missing[0]
-        if not (needle.isascii() and needle.isalnum() and len(needle) >= 3):
-            return None
-        candidates = [
-            token for token in tterms
-            if token.isascii() and token.isalnum()
-            and abs(len(token) - len(needle)) <= 1
-        ]
-        if not any(_edit_distance_at_most_one(needle, token) for token in candidates):
-            return None
-        fuzzy = True
+        # Short ASCII terms such as "up" must be whole words.  For longer
+        # terms, substring matches remain useful for names such as SuperMario,
+        # but rank below true token matches.
+        if not _short_ascii_term(term):
+            match_index = None
+            for i in range(cursor, len(tterms)):
+                if term in tterms[i]:
+                    match_index = i
+                    break
+            if match_index is None:
+                for i, token in enumerate(tterms):
+                    if term in token:
+                        match_index = i
+                        break
+            if match_index is not None:
+                partial += 1
+                positions.append(match_index)
+                cursor = match_index + 1
+                continue
 
-    ordered = positions == sorted(positions)
-    tier = 7 if fuzzy else (5 if ordered else 6)
-    return (tier, len(tnorm))
+        missing.append(term)
+
+    if not missing:
+        ordered = positions == sorted(positions)
+        if partial == 0:
+            return (4 if ordered else 5, len(tnorm))
+        return (6 if ordered else 7, partial, len(tnorm))
+
+    # Joined-word fallback: "supermario" should still find "Super Mario".
+    if len(qcompact) >= 3 and qcompact in tcompact:
+        return (8, len(tnorm))
+
+    if not (allow_fuzzy and len(missing) == 1 and exact >= 1):
+        return None
+    needle = missing[0]
+    if not (needle.isascii() and needle.isalnum() and len(needle) >= 3):
+        return None
+    candidates = [
+        token for token in tterms
+        if token.isascii() and token.isalnum()
+        and abs(len(token) - len(needle)) <= 1
+    ]
+    if not any(_edit_distance_at_most_one(needle, token) for token in candidates):
+        return None
+    return (9, len(tnorm))
 
 
 def rank_text(query, target, allow_fuzzy=True):
