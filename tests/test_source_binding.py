@@ -203,7 +203,7 @@ def test_song_startup_does_not_publish_foreign_db_when_refresh_fails(
         )
     else:
         mod2 = load_songs(monkeypatch, tmp_path)
-        monkeypatch.setattr(mod2, 'SCHEMA', 2)
+        monkeypatch.setattr(mod2, 'SCHEMA', mod.SCHEMA + 1)
     net = RequestRecorder([
         {'url': mod2.SONGS_MANIFEST_URL, 'data': manifest_bytes(songs_tsv)},
         {'url': mod2.SONGS_URL,

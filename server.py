@@ -85,6 +85,7 @@ from curl_cffi import requests as creq
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from khinsider_player import extract_player_urls, valid_mp3_url
+from search_utils import normalize_text, rank_normalized, rank_text
 
 try:
     import songs as song_index
@@ -97,7 +98,7 @@ else:
 BASE = 'https://downloads.khinsider.com'
 API_VERSION = '1.16.1'
 SERVER_TYPE = 'khinsider-relay'
-SERVER_VERSION = '0.2.0'
+SERVER_VERSION = '0.3.0'
 USERNAME = os.environ.get('SUBSONIC_USER', 'admin')
 PASSWORD = os.environ.get('SUBSONIC_PASSWORD', 'admin')
 CACHE_DIR = os.environ.get('CACHE_DIR', './cache')
@@ -429,7 +430,7 @@ PUB_ALBUMS = {}      # publisher (or developer) -> [(slug, title)]
 PUB_LOOKUP = {}      # normalized publisher name -> the exact name used above
 GENRE_ALBUMS = {}    # genre name -> [slug]
 GENRE_LOOKUP = {}    # normalized genre name -> the exact name used above
-SEARCH = []          # (lower_title, slug)
+SEARCH = []          # (normalized_title, slug)
 LETTERS = []
 PUBLISHERS = []
 GENRES = []
@@ -460,7 +461,7 @@ def build_library_indexes(lib):
         meta = normalize_meta(a)
         albums[slug] = meta
         letter_albums.setdefault(meta['letter'], []).append((slug, meta['title']))
-        search.append((meta['title'].lower(), slug))
+        search.append((normalize_text(meta['title']), slug))
         if meta['year'] or meta['publishers'] or meta['platforms'] or meta['album_type']:
             meta_albums += 1
         pubs = meta['publishers'] or meta['developers']
@@ -1535,7 +1536,7 @@ async def subsonic(endpoint: str, request: Request):
         return respond({'songsByGenre': {'song': []}}, fmt)
 
     if ep in ('search2', 'search3'):
-        query = (q.get('query') or '').strip().strip('"').lower()
+        query = (q.get('query') or '').strip().strip('"')
         acount = max(0, _int(q, 'artistCount', 20))
         artoffset = max(0, _int(q, 'artistOffset', 0))
         alcount = max(0, _int(q, 'albumCount', 20))
@@ -1543,10 +1544,23 @@ async def subsonic(endpoint: str, request: Request):
         artists, albums = [], []
         image = _image_url(request, q)
         if query:
-            hits = [slug for title, slug in SEARCH if query in title]
+            query_norm = normalize_text(query)
+            album_hits = []
+            for normalized, slug in SEARCH:
+                score = rank_normalized(query_norm, normalized, allow_fuzzy=True)
+                if score is not None:
+                    album_hits.append((score, ALBUMS[slug]['title'].casefold(), slug))
+            album_hits.sort()
+            hits = [slug for _, _, slug in album_hits]
             albums = [album_child(s) for s in hits[aoffset:aoffset + alcount]]
             if acount:
-                matches = [e for e in _artist_entries() if query in e[1].lower()]
+                artist_hits = []
+                for entry in _artist_entries():
+                    score = rank_text(query, entry[1], allow_fuzzy=True)
+                    if score is not None:
+                        artist_hits.append((score, entry[1].casefold(), entry))
+                artist_hits.sort(key=lambda row: (row[0], row[1]))
+                matches = [entry for _, _, entry in artist_hits]
                 artists = [artist_child(aid, name, count, image)
                            for aid, name, count in matches[artoffset:artoffset + acount]]
         else:

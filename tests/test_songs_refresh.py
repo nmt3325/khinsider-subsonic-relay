@@ -342,7 +342,7 @@ def test_schema_change_forces_download_instead_of_manifest_skip(monkeypatch, tmp
     build_good_db(monkeypatch, mod, tsv_text)
 
     mod2 = load_module(monkeypatch, tmp_path)
-    monkeypatch.setattr(mod2, 'SCHEMA', 2)
+    monkeypatch.setattr(mod2, 'SCHEMA', mod.SCHEMA + 1)
     net = install_net(monkeypatch, mod2, [
         {'url': mod2.SONGS_MANIFEST_URL, 'data': manifest_bytes(tsv_text, gzip_bytes(tsv_text))},
         {'url': mod2.SONGS_URL,
@@ -352,7 +352,7 @@ def test_schema_change_forces_download_instead_of_manifest_skip(monkeypatch, tmp
     ])
     assert mod2._ensure() is not None
     meta = read_meta(mod2.SONGS_DB)
-    assert meta['schema'] == '2'
+    assert meta['schema'] == str(mod2.SCHEMA)
     assert meta['etag'] == 'schema-v2'
     assert len(net.calls) == 2
 

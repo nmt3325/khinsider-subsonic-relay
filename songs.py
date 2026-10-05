@@ -30,6 +30,8 @@ import time
 import urllib.error
 import urllib.request
 
+from search_utils import compact_text, normalize_text, rank_text, terms
+
 DEFAULT_SONGS_URL = (
     'https://github.com/nmt3325/khinsider-index/releases/download/'
     'song-index/songs.tsv.gz')
@@ -48,7 +50,7 @@ SONG_SEARCH = (os.environ.get('SONG_SEARCH') or 'auto').strip().lower()
 ALBUM_LIMIT = int(os.environ.get('SONG_SEARCH_ALBUM_LIMIT') or 12)
 CANDIDATES = int(os.environ.get('SONG_SEARCH_CANDIDATES') or 600)
 
-SCHEMA = 1
+SCHEMA = 2
 TSV_SCHEMA = 1
 MIN_QUERY = 3  # the trigram tokenizer cannot match shorter needles
 USER_AGENT = 'khinsider-subsonic-relay'
@@ -356,6 +358,11 @@ def _swap_in(db_path):
     return True
 
 
+def _search_rows(path):
+    for album, disc, number, title in _rows(path):
+        yield (album, disc, number, title, normalize_text(title), compact_text(title))
+
+
 def _build(tsv_gz, db_path, meta):
     tmp = db_path + '.building'
     for stale in (tmp, tmp + '-journal'):
@@ -364,11 +371,18 @@ def _build(tsv_gz, db_path, meta):
     con = sqlite3.connect(tmp)
     con.execute('PRAGMA journal_mode=OFF')
     con.execute('PRAGMA synchronous=OFF')
-    con.execute('CREATE TABLE song(album TEXT NOT NULL, disc INT, n INT, title TEXT NOT NULL)')
-    con.executemany('INSERT INTO song(album,disc,n,title) VALUES (?,?,?,?)', _rows(tsv_gz))
-    con.execute('CREATE VIRTUAL TABLE fts USING fts5(title, content="song", '
-                'content_rowid="rowid", tokenize="trigram")')
-    con.execute('INSERT INTO fts(rowid, title) SELECT rowid, title FROM song')
+    con.execute(
+        'CREATE TABLE song(album TEXT NOT NULL, disc INT, n INT, title TEXT NOT NULL, '
+        'search_title TEXT NOT NULL, compact_title TEXT NOT NULL)')
+    con.executemany(
+        'INSERT INTO song(album,disc,n,title,search_title,compact_title) VALUES (?,?,?,?,?,?)',
+        _search_rows(tsv_gz))
+    con.execute(
+        'CREATE VIRTUAL TABLE fts USING fts5(search_title, compact_title, content="song", '
+        'content_rowid="rowid", tokenize="trigram")')
+    con.execute(
+        'INSERT INTO fts(rowid, search_title, compact_title) '
+        'SELECT rowid, search_title, compact_title FROM song')
     con.execute('CREATE INDEX song_album ON song(album)')
     con.execute('CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT)')
     rows = con.execute('SELECT count(*) FROM song').fetchone()[0]
@@ -380,6 +394,89 @@ def _build(tsv_gz, db_path, meta):
     con.close()
     os.replace(tmp, db_path)
     return rows
+
+
+def _migrate_v1_db(db_path):
+    """Upgrade the local v1 search DB without re-downloading the 3.3M-row TSV."""
+    meta = _read_meta(db_path)
+    if not (int(meta.get('schema') or 0) == 1 and SCHEMA == 2
+            and int(meta.get('tsv_schema') or 0) == TSV_SCHEMA
+            and meta.get('source') == SONGS_URL
+            and _hash_hex(meta.get('content_digest'))):
+        return False
+
+    tmp = db_path + '.migrating'
+    for stale in (tmp, tmp + '-journal'):
+        if os.path.exists(stale):
+            os.remove(stale)
+    source = target = None
+    try:
+        source = _open_db(db_path)
+        columns = {row[1] for row in source.execute('PRAGMA table_info(song)')}
+        if not {'album', 'disc', 'n', 'title'}.issubset(columns):
+            return False
+
+        target = sqlite3.connect(tmp)
+        target.execute('PRAGMA journal_mode=OFF')
+        target.execute('PRAGMA synchronous=OFF')
+        target.execute(
+            'CREATE TABLE song(album TEXT NOT NULL, disc INT, n INT, title TEXT NOT NULL, '
+            'search_title TEXT NOT NULL, compact_title TEXT NOT NULL)')
+        cursor = source.execute('SELECT album,disc,n,title FROM song ORDER BY rowid')
+        rows = 0
+        while True:
+            batch = cursor.fetchmany(20000)
+            if not batch:
+                break
+            prepared = [
+                (album, disc, number, title, normalize_text(title), compact_text(title))
+                for album, disc, number, title in batch
+            ]
+            target.executemany(
+                'INSERT INTO song(album,disc,n,title,search_title,compact_title) '
+                'VALUES (?,?,?,?,?,?)', prepared)
+            rows += len(prepared)
+
+        target.execute(
+            'CREATE VIRTUAL TABLE fts USING fts5(search_title, compact_title, content="song", '
+            'content_rowid="rowid", tokenize="trigram")')
+        target.execute(
+            'INSERT INTO fts(rowid, search_title, compact_title) '
+            'SELECT rowid, search_title, compact_title FROM song')
+        target.execute('CREATE INDEX song_album ON song(album)')
+        target.execute('CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT)')
+        upgraded = dict(meta)
+        upgraded.update({
+            'schema': str(SCHEMA),
+            'rows': str(rows),
+            'built': str(int(time.time())),
+            'checked': str(int(time.time())),
+        })
+        target.executemany('INSERT INTO meta(k,v) VALUES (?,?)', upgraded.items())
+        target.commit()
+        target.close()
+        target = None
+        source.close()
+        source = None
+
+        expected = int(meta.get('rows') or 0)
+        if expected and rows != expected:
+            raise ValueError('migrated row count mismatch')
+        os.replace(tmp, db_path)
+        print('song index: migrated local schema v1 -> v2 (%d rows)' % rows)
+        return True
+    except Exception as exc:
+        print('song index: local schema migration failed (%s)' % exc)
+        return False
+    finally:
+        for con in (target, source):
+            if con is not None:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def _sync(force=False):
@@ -477,6 +574,8 @@ def _ensure():
         return None    # first build in flight; song search stays empty for now
     try:
         meta = _read_meta(SONGS_DB)
+        if _migrate_v1_db(SONGS_DB):
+            meta = _read_meta(SONGS_DB)
         runtime_bound = _meta_matches_runtime(meta)
         con = _usable(SONGS_DB, runtime_bound=runtime_bound, apply_state=runtime_bound)
         if con is not None and runtime_bound:
@@ -521,38 +620,108 @@ def start():
                          daemon=True).start()
 
 
-def _match(query):
-    return '"%s"' % query.replace('"', '""')
+def _quote_fts(value):
+    return '"%s"' % value.replace('"', '""')
+
+
+def _fts_rows(con, expression, limit):
+    return con.execute(
+        'SELECT s.rowid, s.album, s.disc, s.n, s.title, bm25(fts) '
+        'FROM fts JOIN song s ON s.rowid = fts.rowid '
+        'WHERE fts MATCH ? ORDER BY bm25(fts), s.rowid LIMIT ?',
+        (expression, limit)).fetchall()
+
+
+def _trigram_fallbacks(compact):
+    """Selective two-anchor plans for joined words and one-edit misspellings."""
+    if len(compact) < 5:
+        return []
+    grams = []
+    for i in range(len(compact) - 2):
+        gram = compact[i:i + 3]
+        if gram not in grams:
+            grams.append(gram)
+    if len(grams) < 2:
+        return []
+    picks = [0, len(grams) // 2, len(grams) - 1]
+    pairs = []
+    for a, b in ((picks[0], picks[1]), (picks[1], picks[2]), (picks[0], picks[2])):
+        if a == b:
+            continue
+        pair = (grams[a], grams[b])
+        if pair not in pairs:
+            pairs.append(pair)
+    return [
+        'compact_title:%s AND compact_title:%s' % (_quote_fts(a), _quote_fts(b))
+        for a, b in pairs
+    ]
+
+
+def _query_plans(query):
+    qnorm = normalize_text(query)
+    qcompact = qnorm.replace(' ', '')
+    long_terms = []
+    for term in terms(qnorm):
+        if len(term) >= MIN_QUERY and term not in long_terms:
+            long_terms.append(term)
+
+    plans = []
+    if len(qcompact) >= MIN_QUERY:
+        plans.append('compact_title:%s' % _quote_fts(qcompact))
+    if long_terms:
+        plans.append(' AND '.join(_quote_fts(term) for term in long_terms))
+    # Fallback anchors let one misspelled term survive when another is exact.
+    for term in sorted(long_terms, key=len, reverse=True):
+        plans.append(_quote_fts(term))
+    plans.extend(_trigram_fallbacks(qcompact))
+
+    out = []
+    seen = set()
+    for plan in plans:
+        if plan and plan not in seen:
+            seen.add(plan)
+            out.append(plan)
+    return out
 
 
 def candidates(query, limit=None):
-    """Ranked (album, disc, n, title) index rows for a query."""
+    """Ranked (album, disc, n, title) rows using normalized FTS + typo fallback."""
     con = _ensure()
     query = (query or '').strip()
-    if con is None or len(query) < MIN_QUERY:
+    maximum = max(1, int(limit or CANDIDATES))
+    if con is None or len(compact_text(query)) < MIN_QUERY:
+        return []
+
+    merged = {}
+    plans = _query_plans(query)
+    if not plans:
         return []
     try:
         with _lock:
-            rows = con.execute(
-                'SELECT s.album, s.disc, s.n, s.title FROM fts '
-                'JOIN song s ON s.rowid = fts.rowid '
-                'WHERE fts MATCH ? LIMIT ?',
-                (_match(query), limit or CANDIDATES)).fetchall()
+            for index, plan in enumerate(plans):
+                # Exact compact / all-term plans get the full budget. Fallback
+                # anchors are capped so a generic word cannot drown relevance.
+                per_plan = maximum if index < 2 else min(maximum, max(100, maximum // 2))
+                for rowid, album, disc, number, title, bm25 in _fts_rows(con, plan, per_plan):
+                    old = merged.get(rowid)
+                    item = (album, disc, number, title, bm25)
+                    if old is None or bm25 < old[4]:
+                        merged[rowid] = item
+                if len(merged) >= maximum * 2:
+                    break
     except Exception as exc:
         print('song search failed: %s' % exc)
         return []
-    needle = key(query)
 
-    def rank(row):
-        k = key(row[3])
-        if k == needle:
-            return (0, 0, row[0])
-        if k.startswith(needle):
-            return (1, len(k), row[0])
-        return (2, k.find(needle), row[0])
-
-    return sorted(rows, key=rank)
-
+    ranked = []
+    for album, disc, number, title, bm25 in merged.values():
+        relevance = rank_text(query, title, allow_fuzzy=True)
+        if relevance is None:
+            continue
+        ranked.append((relevance, bm25, album, disc, number, title))
+    ranked.sort(key=lambda row: (row[0], row[1], row[2], row[4] or 0, row[5]))
+    return [(album, disc, number, title)
+            for _, _, album, disc, number, title in ranked[:maximum]]
 
 def search(query, count=20, offset=0):
     """Subsonic song dicts for search2/search3, resolved against live pages."""
