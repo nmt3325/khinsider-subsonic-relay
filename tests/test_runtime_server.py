@@ -98,6 +98,7 @@ class RuntimeServerTests(unittest.TestCase):
         os.environ['CACHE_DIR'] = str(cache_dir)
         os.environ['LIBRARY_PATH'] = str(library_path)
         os.environ['PLAYLISTS_PATH'] = str(Path(tempdir.name) / 'playlists.json')
+        os.environ['USER_STATS_PATH'] = str(Path(tempdir.name) / 'user_data.sqlite')
         os.environ['LIBRARY_URL'] = DEFAULT_LIBRARY_URL
         os.environ['LIBRARY_REFRESH_HOURS'] = '0'
         os.environ['LIBRARY_MAX_AGE_HOURS'] = '0'
@@ -152,6 +153,98 @@ class RuntimeServerTests(unittest.TestCase):
         for ext, url in files.items():
             parts.append(f'<a href="{url}"><span class="songDownloadLink">{ext}</span></a>')
         return '<html>' + ''.join(parts) + '</html>'
+
+    def test_rating_persists_and_song_metadata_reports_stats(self):
+        mod = self.load_server()
+        song_id = 'track/demo/1'
+        client = TestClient(mod.app)
+        creds = {'u': 'admin', 'p': 'admin', 'f': 'json'}
+        def ok(endpoint, **params):
+            reply = client.get('/rest/' + endpoint, params=dict(creds, **params))
+            self.assertEqual(reply.status_code, 200)
+            body = reply.json()['subsonic-response']
+            self.assertEqual(body['status'], 'ok', body)
+            return body
+        def mocked_song(song):
+            return {'id': song, 'title': 'Demo'} if song == song_id else None
+        with mock.patch.object(mod, '_song_by_id', side_effect=mocked_song):
+            ok('setRating', id=song_id, rating=5)
+            self.assertEqual(mod.user_stats.get(song_id)['userRating'], 5)
+            ok('setRating', id=song_id, rating=2)
+            self.assertEqual(mod.user_stats.get(song_id)['userRating'], 2)
+            for bad in ('-1', '6', 'abc', '2.5', '1.0', '02'):
+                response = client.get('/rest/setRating', params=dict(creds, id=song_id, rating=bad))
+                self.assertEqual(response.json()['subsonic-response']['status'], 'failed')
+            self.assertEqual(mod.user_stats.get(song_id)['userRating'], 2)
+            missing = client.get('/rest/setRating', params=dict(creds, id='track/missing/1', rating=3))
+            self.assertEqual(missing.json()['subsonic-response']['status'], 'failed')
+            ok('setRating', id=song_id, rating=0)
+            self.assertNotIn('userRating', mod.user_stats.get(song_id))
+            ok('setRating', id=song_id, rating=4)
+            unauthorized = client.get('/rest/setRating', params={'u':'other','p':'wrong','f':'json','id':song_id,'rating':3})
+            self.assertEqual(unauthorized.json()['subsonic-response']['status'], 'failed')
+            self.assertEqual(mod.user_stats.get(song_id)['userRating'], 4)
+
+        # All song APIs pass through song_child, which carries the persisted stats.
+        value = mod.song_child('demo', 'Demo Album', {'title':'Demo Album'},
+                               {'title':'Demo', 'basename':'demo.mp3'}, 1)
+        self.assertEqual(value['userRating'], 4)
+        self.assertNotIn('playCount', value)
+        from user_stats import UserStatsStore
+        reopened = UserStatsStore(mod.USER_STATS_PATH)
+        self.assertEqual(reopened.get(song_id)['userRating'], 4)
+
+    def test_scrobble_history_counts_timestamps_and_multi_song_batch(self):
+        mod = self.load_server()
+        client = TestClient(mod.app)
+        creds = {'u':'admin', 'p':'admin', 'f':'json'}
+        ids = ('track/demo/1', 'track/demo/2')
+        def mocked_song(song):
+            return {'id': song, 'title': 'Song'} if song in ids else None
+        with mock.patch.object(mod, '_song_by_id', side_effect=mocked_song):
+            def req(endpoint, params):
+                resp = client.get('/rest/' + endpoint, params=dict(creds, **params))
+                return resp.json()['subsonic-response']
+            self.assertEqual(req('scrobble', {'id': ids[0], 'submission': 'false'})['status'], 'ok')
+            self.assertEqual(mod.user_stats.get(ids[0]), {})
+            first = 1730000000000
+            self.assertEqual(req('scrobble', {'id': ids[0], 'time': first})['status'], 'ok')
+            self.assertEqual(mod.user_stats.get(ids[0])['playCount'], 1)
+            self.assertEqual(mod.user_stats.get(ids[0])['played'], '2024-10-27T03:33:20.000Z')
+            later = first + 10000
+            batch = [('u','admin'),('p','admin'),('f','json'),
+                     ('id', ids[0]),('id',ids[1]),('time',str(later)),('time',str(first-1000))]
+            response = client.post('/rest/scrobble.view', content=urllib.parse.urlencode(batch).encode(),
+                                   headers={'Content-Type':'application/x-www-form-urlencoded'})
+            self.assertEqual(response.json()['subsonic-response']['status'], 'ok')
+            self.assertEqual(mod.user_stats.get(ids[0])['playCount'], 2)
+            self.assertEqual(mod.user_stats.get(ids[0])['played'], '2024-10-27T03:33:30.000Z')
+            self.assertEqual(mod.user_stats.get(ids[1])['playCount'], 1)
+            history = req('getPlayHistory', {'count': 10})['playHistory']['entry']
+            self.assertEqual(len(history), 3)
+            self.assertEqual([row['id'] for row in history], [ids[0], ids[0], ids[1]])
+            self.assertEqual(history[0]['playedAtMs'], later)
+            self.assertEqual(req('getRecentlyPlayed', {'count': 1, 'offset':1})['playHistory']['entry'][0]['id'], ids[0])
+
+            before = mod.user_stats.get(ids[0])['playCount']
+            malformed = [('u','admin'),('p','admin'),('f','json'),
+                         ('id', ids[0]),('id',ids[1]),('time','1')]
+            self.assertEqual(client.post('/rest/scrobble', content=urllib.parse.urlencode(malformed).encode(),
+                                         headers={'Content-Type':'application/x-www-form-urlencoded'}).json()['subsonic-response']['status'], 'failed')
+            self.assertEqual(mod.user_stats.get(ids[0])['playCount'], before)
+            self.assertEqual(req('scrobble', {'id': 'track/bad/3'})['status'], 'failed')
+            self.assertEqual(req('scrobble', {'id': ids[0], 'time':'xyz'})['status'], 'failed')
+            self.assertEqual(req('scrobble', {'id': ids[0], 'time':'-1'})['status'], 'failed')
+            self.assertEqual(mod.user_stats.get(ids[0])['playCount'], before)
+
+        from user_stats import UserStatsStore
+        reopened = UserStatsStore(mod.USER_STATS_PATH)
+        self.assertEqual(len(reopened.recent()), 3)
+        self.assertEqual(reopened.get(ids[0])['playCount'], 2)
+        metadata = mod.song_child('demo', 'Demo', {'title':'Demo'},
+                                  {'title':'Demo', 'basename':'demo.mp3'}, 1)
+        self.assertEqual(metadata['playCount'], 2)
+        self.assertIn('played', metadata)
 
     def test_live_library_contract_rejects_partial_or_mixed_payloads(self):
         module = self.load_server()

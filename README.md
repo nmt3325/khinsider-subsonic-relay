@@ -209,3 +209,37 @@ ruff check --select E9,F63,F7,F82 server.py songs.py khinsider_player.py tests t
 ```
 
 同梱のHTML断片とHTTPモックを使うため、テストに実クロールや音声ダウンロードは不要です。
+
+
+## Listening statistics (v0.5.0)
+
+The relay stores song ratings, completed play history, last played times and
+play counts in \`USER_STATS_PATH\`, defaulting to \`user_data.sqlite\` next to
+\`LIBRARY_PATH\` (normally \`/data/user_data.sqlite\` in Docker). The file is
+separate from the replaceable song-search index (\`songs.sqlite\`) and survives
+container restarts when \`/data\` is a persistent volume.
+
+* \`setRating.view?id=track/<album>/<index>&rating=1..5\` saves a personal
+  1-5 star rating; \`rating=0\` clears the rating. Ratings are returned as
+  \`userRating\` on song objects.
+* \`scrobble.view?id=...\` records **completed** playback(s) and updates
+  \`playCount\` and \`played\` (UTC ISO-8601) on song objects, including
+  \`getSong\`, album tracks, playlist entries and song search results.
+  \`time\` accepts Unix epoch **milliseconds**, and multiple \`id\`/\`time\`
+  pairs are supported in one request. When \`time\` is omitted, the current
+  server time is used.
+* \`submission=false\` is only a now-playing notification: it does **not**
+  increment the play count or record a completed play. Merely requesting
+  \`stream\` or \`download\` does not count as a completed play; the client
+  must send a \`scrobble\` submission.
+* The relay-specific \`getPlayHistory.view?count=100&offset=0\` endpoint
+  (alias \`getRecentlyPlayed.view\`) lists completed listening events in
+  reverse chronological order as \`playHistory.entry[]\`. Each returned
+  track includes \`playedAt\`, \`playedAtMs\` and \`historyId\`. This is
+  a **non-standard extension**, not the Subsonic \`getNowPlaying\` endpoint.
+* The server currently has one configured Subsonic account. Listening state
+  belongs to that account, not to individual devices or clients.
+
+The \`/data/user_data.sqlite\` file is important user data and should be
+included in backups alongside \`/data/playlists.json\`. **Do not delete it
+when clearing search or album caches.**

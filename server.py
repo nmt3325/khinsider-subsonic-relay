@@ -86,6 +86,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from khinsider_player import extract_player_urls, valid_mp3_url
 from playlists import PlaylistStore
+from user_stats import UserStatsStore
 from search_utils import normalize_text, rank_normalized, rank_text
 
 try:
@@ -99,13 +100,15 @@ else:
 BASE = 'https://downloads.khinsider.com'
 API_VERSION = '1.16.1'
 SERVER_TYPE = 'khinsider-relay'
-SERVER_VERSION = '0.4.0'
+SERVER_VERSION = '0.5.0'
 USERNAME = os.environ.get('SUBSONIC_USER', 'admin')
 PASSWORD = os.environ.get('SUBSONIC_PASSWORD', 'admin')
 CACHE_DIR = os.environ.get('CACHE_DIR', './cache')
 LIBRARY_PATH = os.environ.get('LIBRARY_PATH', './library.json')
 PLAYLISTS_PATH = os.environ.get('PLAYLISTS_PATH') or os.path.join(
     os.path.dirname(LIBRARY_PATH) or '.', 'playlists.json')
+USER_STATS_PATH = os.environ.get('USER_STATS_PATH') or os.path.join(
+    os.path.dirname(LIBRARY_PATH) or '.', 'user_data.sqlite')
 LIBRARY_URL = os.environ.get(
     'LIBRARY_URL',
     'https://github.com/nmt3325/khinsider-index/releases/latest/download/library.json')
@@ -144,6 +147,7 @@ os.makedirs(os.path.join(CACHE_DIR, 'albums'), exist_ok=True)
 os.makedirs(os.path.join(CACHE_DIR, 'tracks'), exist_ok=True)
 
 playlist_store = PlaylistStore(PLAYLISTS_PATH, USERNAME)
+user_stats = UserStatsStore(USER_STATS_PATH)
 sess = creq.Session(impersonate='chrome')
 
 # ---------------- metadata helpers ----------------
@@ -1213,6 +1217,7 @@ def song_child(slug, album_title, meta, t, idx, cover=None):
         if duration:
             d['bitRate'] = max(1, round(size * 8 / duration / 1000))
     apply_meta(d, meta)
+    d.update(user_stats.get(d['id']))
     d['path'] = '%s/%s/%s' % (_sanitize(d['artist']), _sanitize(album_title), _sanitize(t['basename']))
     return d
 
@@ -1802,7 +1807,67 @@ async def subsonic(endpoint: str, request: Request):
                                  headers={'Content-Length': upstream.headers['Content-Length']}
                                  if upstream.headers.get('Content-Length') else None)
 
-    if ep in ('scrobble', 'star', 'unstar', 'setRating', 'savePlayQueue'):
+    if ep == 'setRating':
+        song_id = q.get('id')
+        if not song_id:
+            return sub_error(fmt, 10, 'Required parameter id is missing.')
+        try:
+            rating = int(q['rating'])
+        except (KeyError, ValueError, TypeError):
+            return sub_error(fmt, 10, 'Rating must be an integer from 0 to 5.')
+        if str(rating) != q.get('rating', '').strip() or not 0 <= rating <= 5:
+            return sub_error(fmt, 10, 'Rating must be an integer from 0 to 5.')
+        if _song_by_id(song_id) is None:
+            return sub_error(fmt, 70, 'Song not found.')
+        user_stats.set_rating(song_id, rating)
+        return respond({}, fmt)
+
+    if ep == 'scrobble':
+        song_ids = multi.get('id', [])
+        if not song_ids:
+            return sub_error(fmt, 10, 'Required parameter id is missing.')
+        if len(song_ids) > 500:
+            return sub_error(fmt, 10, 'Too many scrobble entries.')
+        try:
+            submission = _bool_param(q.get('submission', 'true'))
+        except ValueError:
+            return sub_error(fmt, 10, 'Invalid submission parameter.')
+        # Now-playing notifications do not count as completed plays.
+        if not submission:
+            return respond({}, fmt)
+        timestamps = multi.get('time', [])
+        if timestamps and len(timestamps) != len(song_ids):
+            return sub_error(fmt, 10, 'One time value is required per song id.')
+        now_ms = int(time.time() * 1000)
+        entries = []
+        for i, song_id in enumerate(song_ids):
+            if _song_by_id(song_id) is None:
+                return sub_error(fmt, 70, 'Song not found: %s' % song_id)
+            try:
+                played_ms = int(timestamps[i]) if timestamps else now_ms
+            except (ValueError, TypeError):
+                return sub_error(fmt, 10, 'Invalid scrobble timestamp.')
+            if not 0 <= played_ms <= 253402300799999:
+                return sub_error(fmt, 10, 'Invalid scrobble timestamp.')
+            entries.append((song_id, played_ms))
+        user_stats.record_plays(entries)
+        return respond({}, fmt)
+
+    if ep in ('getPlayHistory', 'getRecentlyPlayed'):
+        # Relay extension: unlike getNowPlaying, this returns completed plays.
+        limit = max(1, min(_int(q, 'count', 100), 500))
+        offset = max(0, _int(q, 'offset', 0))
+        entries = []
+        for item in user_stats.recent(limit=limit, offset=offset):
+            song = _song_by_id(item['song_id'])
+            if song is not None:
+                song['playedAt'] = item['playedAt']
+                song['playedAtMs'] = item['playedAtMs']
+                song['historyId'] = item['id']
+                entries.append(song)
+        return respond({'playHistory': {'entry': entries}}, fmt)
+
+    if ep in ('star', 'unstar', 'savePlayQueue'):
         return respond({}, fmt)
 
     if ep in ('getStarred', 'getStarred2'):
