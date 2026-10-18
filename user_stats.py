@@ -42,6 +42,14 @@ class UserStatsStore:
                     ON play_history(played_at_ms DESC, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_play_history_song
                     ON play_history(song_id, played_at_ms DESC);
+                CREATE TABLE IF NOT EXISTS favorites (
+                    kind TEXT NOT NULL CHECK(kind IN ('song', 'album', 'artist')),
+                    item_id TEXT NOT NULL,
+                    starred_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (kind, item_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_favorites_time
+                    ON favorites(starred_at_ms DESC);
             ''')
 
     @contextmanager
@@ -66,6 +74,48 @@ class UserStatsStore:
                 VALUES (?, ?)
                 ON CONFLICT(song_id) DO UPDATE SET rating=excluded.rating
             ''', (song_id, rating or None))
+
+    def set_favorites(self, entries, starred):
+        """Atomically star/unstar (kind, item_id) pairs, preserving first-star time.
+
+        This is distinct from ratings: removing a favorite must never erase
+        its 1-5-star score, scrobbles, or play history.
+        """
+        entries = list(dict.fromkeys(entries))
+        if not entries:
+            raise ValueError('At least one favorite id must be provided.')
+        for kind, item_id in entries:
+            if kind not in ('song', 'album', 'artist') or not item_id:
+                raise ValueError('Invalid favorite id.')
+        now = int(time.time() * 1000)
+        with self.lock, self._conn() as db:
+            if starred:
+                db.executemany('''
+                    INSERT OR IGNORE INTO favorites(kind, item_id, starred_at_ms)
+                    VALUES (?, ?, ?)
+                ''', [(kind, item_id, now) for kind, item_id in entries])
+            else:
+                db.executemany('''
+                    DELETE FROM favorites WHERE kind = ? AND item_id = ?
+                ''', entries)
+
+    def starred_at(self, kind, item_id):
+        with self.lock, self._conn() as db:
+            row = db.execute('''
+                SELECT starred_at_ms FROM favorites
+                WHERE kind = ? AND item_id = ?
+            ''', (kind, item_id)).fetchone()
+        return _iso_time(row[0]) if row else None
+
+    def favorites(self, kind):
+        if kind not in ('song', 'album', 'artist'):
+            raise ValueError('Invalid favorite kind.')
+        with self.lock, self._conn() as db:
+            rows = db.execute('''
+                SELECT item_id, starred_at_ms FROM favorites WHERE kind = ?
+                ORDER BY starred_at_ms DESC, item_id ASC
+            ''', (kind,)).fetchall()
+        return [(item_id, _iso_time(at_ms)) for item_id, at_ms in rows]
 
     def record_plays(self, entries):
         """Persist a batch atomically as (song_id, epoch_milliseconds) pairs."""
@@ -92,11 +142,11 @@ class UserStatsStore:
     def get(self, song_id):
         with self.lock, self._conn() as db:
             row = db.execute('''
-                SELECT rating, play_count, last_played_ms
-                FROM track_stats WHERE song_id = ?
+                SELECT t.rating, t.play_count, t.last_played_ms, f.starred_at_ms
+                FROM (SELECT ? AS id) AS target
+                LEFT JOIN track_stats AS t ON t.song_id = target.id
+                LEFT JOIN favorites AS f ON f.kind = 'song' AND f.item_id = target.id
             ''', (song_id,)).fetchone()
-        if row is None:
-            return {}
         result = {}
         if row[0] is not None:
             result['userRating'] = row[0]
@@ -104,6 +154,8 @@ class UserStatsStore:
             result['playCount'] = row[1]
         if row[2] is not None:
             result['played'] = _iso_time(row[2])
+        if row[3] is not None:
+            result['starred'] = _iso_time(row[3])
         return result
 
     def recent(self, limit=100, offset=0):

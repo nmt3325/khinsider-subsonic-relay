@@ -243,3 +243,28 @@ container restarts when \`/data\` is a persistent volume.
 The \`/data/user_data.sqlite\` file is important user data and should be
 included in backups alongside \`/data/playlists.json\`. **Do not delete it
 when clearing search or album caches.**
+
+## Favorites / starred items (v0.6.0)
+
+Favorites are independent of 1-5 ratings. They are stored persistently in
+\`/data/user_data.sqlite\` alongside ratings and listening history, using a
+separate \`favorites\` table so upgrades do not remove any existing state.
+
+* \`star.view?id=track/<album>/<index>\` and \`unstar.view?id=...\`: star/unstar
+  a song. Multiple \`id\` fields can be sent in one request.
+* \`star.view?albumId=album/<slug>\` and \`star.view?artistId=<artist-id>\`:
+  independently star albums or artists. Unstar uses the same parameters.
+  All three kinds of IDs can be combined in one GET or form POST request.
+* \`getStarred.view\` / \`getStarred2.view\`: return the full saved artist,
+  album and song lists, with each item's ISO-8601 \`starred\` timestamp.
+* Favorite timestamps also appear on song, album and artist objects when
+  fetching items through regular browse/search/playlist APIs. Album list
+  \`type=starred\` now returns the starred albums.
+* Repeated \`star\` operations are idempotent and keep the original timestamp.
+  \`unstar\` does not alter ratings, listening history, or play counts.
+* This relay is single-account; starred items synchronize across all devices
+  authenticated to the configured Subsonic user. IDs depend on the album
+  slug and track index and may not survive source album reordering.
+
+If an unsupported \`musicFolderId\` is given to \`getStarred*\`, the result
+is empty (this server's only folder is ID 0).

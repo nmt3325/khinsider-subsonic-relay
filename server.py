@@ -100,7 +100,7 @@ else:
 BASE = 'https://downloads.khinsider.com'
 API_VERSION = '1.16.1'
 SERVER_TYPE = 'khinsider-relay'
-SERVER_VERSION = '0.5.0'
+SERVER_VERSION = '0.6.0'
 USERNAME = os.environ.get('SUBSONIC_USER', 'admin')
 PASSWORD = os.environ.get('SUBSONIC_PASSWORD', 'admin')
 CACHE_DIR = os.environ.get('CACHE_DIR', './cache')
@@ -1181,6 +1181,9 @@ def album_child(slug, parent=None, album=None):
         'coverArt': 'album/' + slug,
     }
     apply_meta(d, meta)
+    starred = user_stats.starred_at('album', d['id'])
+    if starred:
+        d['starred'] = starred
     if meta.get('track_count'):
         d['songCount'] = meta['track_count']
     return d
@@ -1391,6 +1394,9 @@ def artist_child(artist_id_, name, count, image=None, albums=None):
         d['coverArt'] = cover
         if image:
             d['artistImageUrl'] = image(cover)
+    starred = user_stats.starred_at('artist', artist_id_)
+    if starred:
+        d['starred'] = starred
     return d
 
 
@@ -1597,7 +1603,8 @@ async def subsonic(endpoint: str, request: Request):
             slugs = random.sample(pool, min(size, len(pool)))
             offset = 0
         elif kind == 'starred':
-            slugs = []
+            slugs = [item_id[len('album/'):] for item_id, _ in user_stats.favorites('album')
+                     if item_id.startswith('album/') and item_id[len('album/'):] in ALBUMS]
         if slugs is None:
             slugs = ALPHA_SLUGS
         page = slugs[offset:offset + size]
@@ -1867,12 +1874,57 @@ async def subsonic(endpoint: str, request: Request):
                 entries.append(song)
         return respond({'playHistory': {'entry': entries}}, fmt)
 
-    if ep in ('star', 'unstar', 'savePlayQueue'):
+    if ep in ('star', 'unstar'):
+        # Subsonic: id for song(s), albumId for album(s), artistId for artist(s).
+        # Repeated GET and form POST parameters are allowed and applied atomically.
+        selections = []
+        selections.extend(('song', song_id) for song_id in multi.get('id', []))
+        selections.extend(('album', album_id) for album_id in multi.get('albumId', []))
+        selections.extend(('artist', artist_id_) for artist_id_ in multi.get('artistId', []))
+        if not selections:
+            return sub_error(fmt, 10, 'At least one id, albumId or artistId is required.')
+        if len(selections) > 500:
+            return sub_error(fmt, 10, 'Too many favorite entries.')
+        # Validate every id before mutating the database: no partial updates.
+        artists = {aid for aid, _, _ in _artist_entries()}
+        for kind, item_id in selections:
+            if kind == 'song' and _song_by_id(item_id) is None:
+                return sub_error(fmt, 70, 'Song not found.')
+            if kind == 'album' and (not item_id.startswith('album/')
+                                    or item_id[len('album/'):] not in ALBUMS):
+                return sub_error(fmt, 70, 'Album not found.')
+            if kind == 'artist' and item_id not in artists:
+                return sub_error(fmt, 70, 'Artist not found.')
+        user_stats.set_favorites(selections, ep == 'star')
         return respond({}, fmt)
 
     if ep in ('getStarred', 'getStarred2'):
         key = 'starred' if ep == 'getStarred' else 'starred2'
-        return respond({key: {'artist': [], 'album': [], 'song': []}}, fmt)
+        folder = q.get('musicFolderId')
+        if folder not in (None, '', '0'):
+            return respond({key: {'artist': [], 'album': [], 'song': []}}, fmt)
+        image = _image_url(request, q)
+        artists = {aid: (name, count) for aid, name, count in _artist_entries()}
+        starred_artists = [
+            artist_child(aid, artists[aid][0], artists[aid][1], image)
+            for aid, _ in user_stats.favorites('artist') if aid in artists
+        ]
+        starred_albums = [
+            album_child(item_id[len('album/'):])
+            for item_id, _ in user_stats.favorites('album')
+            if item_id.startswith('album/') and item_id[len('album/'):] in ALBUMS
+        ]
+        starred_songs = []
+        for song_id, _ in user_stats.favorites('song'):
+            song = _song_by_id(song_id)
+            if song is not None:
+                starred_songs.append(song)
+        return respond({key: {
+            'artist': starred_artists, 'album': starred_albums, 'song': starred_songs,
+        }}, fmt)
+
+    if ep == 'savePlayQueue':
+        return respond({}, fmt)
 
     if ep == 'getScanStatus':
         return respond({'scanStatus': {'scanning': False, 'count': len(ALBUMS)}}, fmt)

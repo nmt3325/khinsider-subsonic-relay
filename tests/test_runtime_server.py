@@ -246,6 +246,125 @@ class RuntimeServerTests(unittest.TestCase):
         self.assertEqual(metadata['playCount'], 2)
         self.assertIn('played', metadata)
 
+    def test_favorites_persist_independently_of_ratings_for_songs_albums_and_artists(self):
+        payload = {
+            'data_source': 'khinsider-live-v2', 'dataset_schema_version': 2,
+            'complete': True, 'legacy_inputs': [],
+            'albums': [{'slug': 'demo', 'title': 'Demo Album',
+                        'publishers': ['SEGA'], 'track_count': 1}],
+        }
+        mod = self.load_server(payload)
+        client = TestClient(mod.app)
+        creds = {'u': 'admin', 'p': 'admin', 'f': 'json'}
+        song_id = 'track/demo/1'
+        album_id = 'album/demo'
+        artist_id = mod.pub_id('SEGA')
+        sample_track = {'basename': '01. demo.mp3', 'title': 'Demo song',
+                        'formats': ['mp3']}
+        def song(songid):
+            if songid != song_id:
+                return None
+            return mod.song_child('demo', 'Demo Album', mod.ALBUMS['demo'],
+                                  sample_track, 1)
+        def api(endpoint, params=None):
+            res = client.get('/rest/' + endpoint + '.view',
+                             params=dict(creds, **(params or {})))
+            self.assertEqual(res.status_code, 200)
+            return res.json()['subsonic-response']
+        with mock.patch.object(mod, '_song_by_id', side_effect=song):
+            self.assertEqual(api('setRating', {'id':song_id, 'rating':'4'})['status'], 'ok')
+            stars = api('star', {'id':song_id, 'albumId':album_id, 'artistId':artist_id})
+            self.assertEqual(stars['status'], 'ok')
+            first = mod.user_stats.starred_at('song', song_id)
+            self.assertRegex(first, r'^\d{4}-')
+            self.assertEqual(api('star', {'id':song_id})['status'], 'ok')
+            self.assertEqual(mod.user_stats.starred_at('song', song_id), first,
+                             'starring twice must not reset date')
+            self.assertEqual(mod.user_stats.get(song_id)['userRating'], 4)
+            self.assertEqual(mod.user_stats.get(song_id)['starred'], first)
+
+            for endpoint in ('getStarred', 'getStarred2'):
+                data = api(endpoint)['starred2' if endpoint == 'getStarred2' else 'starred']
+                self.assertEqual([r['id'] for r in data['song']], [song_id])
+                self.assertEqual([r['id'] for r in data['album']], [album_id])
+                self.assertEqual([r['id'] for r in data['artist']], [artist_id])
+                self.assertEqual(data['song'][0]['starred'], first)
+                self.assertEqual(data['song'][0]['userRating'], 4)
+                self.assertEqual(data['album'][0]['starred'],
+                                 mod.user_stats.starred_at('album', album_id))
+                self.assertEqual(data['artist'][0]['starred'],
+                                 mod.user_stats.starred_at('artist', artist_id))
+                self.assertEqual(api(endpoint, {'musicFolderId': '4'})[
+                                 'starred2' if endpoint == 'getStarred2' else 'starred']['song'], [])
+
+            self.assertEqual(api('getAlbumList2', {'type':'starred'})['albumList2']['album'][0]['id'], album_id)
+            self.assertEqual(api('getAlbumList', {'type':'starred'})['albumList']['album'][0]['id'], album_id)
+            self.assertEqual(mod.album_child('demo')['starred'], mod.user_stats.starred_at('album', album_id))
+            self.assertEqual(mod.artist_child(artist_id, 'SEGA', 1)['starred'],
+                             mod.user_stats.starred_at('artist', artist_id))
+            self.assertEqual(song(song_id)['starred'], first)
+
+            # Requests with invalid IDs must never modify existing favorites.
+            bad = api('star', {'id':song_id, 'albumId':'album/not-real'})
+            self.assertEqual(bad['status'], 'failed')
+            self.assertEqual(mod.user_stats.starred_at('song', song_id), first)
+            unauth = client.get('/rest/unstar.view', params={
+                'u':'wrong', 'p':'wrong', 'f':'json', 'id':song_id})
+            self.assertEqual(unauth.json()['subsonic-response']['status'], 'failed')
+            self.assertEqual(mod.user_stats.starred_at('song', song_id), first)
+
+            # Save and reload the database, preserving the original play/rating data.
+            mod.user_stats.record_plays([(song_id, 1730000000000)])
+            from user_stats import UserStatsStore
+            reopened = UserStatsStore(mod.USER_STATS_PATH)
+            self.assertEqual(reopened.get(song_id)['starred'], first)
+            self.assertEqual(reopened.get(song_id)['userRating'], 4)
+            self.assertEqual(reopened.get(song_id)['playCount'], 1)
+            self.assertEqual(api('unstar', {'id':song_id})['status'], 'ok')
+            self.assertNotIn('starred', mod.user_stats.get(song_id))
+            self.assertEqual(mod.user_stats.get(song_id)['userRating'], 4)
+            self.assertEqual(mod.user_stats.get(song_id)['playCount'], 1)
+            self.assertEqual(len(api('getStarred2')['starred2']['song']), 0)
+            self.assertEqual(api('unstar', {'albumId':album_id,'artistId':artist_id})['status'], 'ok')
+            self.assertEqual(api('getStarred2')['starred2'], {'artist':[], 'album':[], 'song':[]})
+            self.assertNotIn('starred', mod.album_child('demo'))
+            self.assertNotIn('starred', mod.artist_child(artist_id, 'SEGA', 1))
+            self.assertEqual(api('getAlbumList2', {'type':'starred'})['albumList2']['album'], [])
+
+            # POST accepts repeated song IDs, XML response contains the starred attribute.
+            body = [('u','admin'),('p','admin'),('id',song_id),('id',song_id),
+                    ('albumId',album_id)]
+            response = client.post('/rest/star.view',
+                content=urllib.parse.urlencode(body).encode(),
+                headers={'Content-Type':'application/x-www-form-urlencoded'})
+            self.assertEqual(response.status_code, 200)
+            self.assertIn(b'status="ok"', response.content)
+            xml = client.get('/rest/getStarred.view', params={'u':'admin','p':'admin'})
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(xml.content)
+            song_el = root.find('.//{*}song')
+            self.assertIsNotNone(song_el)
+            self.assertIsNotNone(song_el.attrib.get('starred'))
+            self.assertEqual(len(mod.user_stats.favorites('song')), 1)
+
+    def test_favorites_migrate_existing_user_database(self):
+        from user_stats import UserStatsStore
+        import sqlite3
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'existing.sqlite'
+            conn = sqlite3.connect(path)
+            conn.execute('CREATE TABLE track_stats (song_id TEXT PRIMARY KEY, '
+                         'rating INTEGER, play_count INTEGER, last_played_ms INTEGER)')
+            conn.execute("INSERT INTO track_stats VALUES ('track/demo/1', 5, 2, 1730000000000)")
+            conn.commit()
+            conn.close()
+            # Upgrade in place: do not erase the existing rating or play count.
+            store = UserStatsStore(path)
+            self.assertEqual(store.get('track/demo/1')['userRating'], 5)
+            self.assertEqual(store.get('track/demo/1')['playCount'], 2)
+            store.set_favorites([('song','track/demo/1')], True)
+            self.assertIn('starred', store.get('track/demo/1'))
+
     def test_live_library_contract_rejects_partial_or_mixed_payloads(self):
         module = self.load_server()
         value = {'data_source': 'khinsider-live-v2', 'complete': True,
