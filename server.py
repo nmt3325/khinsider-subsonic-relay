@@ -103,7 +103,7 @@ else:
 BASE = 'https://downloads.khinsider.com'
 API_VERSION = '1.16.1'
 SERVER_TYPE = 'khinsider-relay'
-SERVER_VERSION = '0.6.1'
+SERVER_VERSION = '0.6.2'
 USERNAME = os.environ.get('SUBSONIC_USER', 'admin')
 PASSWORD = os.environ.get('SUBSONIC_PASSWORD', 'admin')
 CACHE_DIR = os.environ.get('CACHE_DIR', './cache')
@@ -1973,10 +1973,18 @@ def _subsonic_dispatch(endpoint, request, q, multi):
         return respond({'playHistory': {'entry': entries}}, fmt)
 
     if ep in ('star', 'unstar'):
-        # Subsonic: id for song(s), albumId for album(s), artistId for artist(s).
+        # Subsonic id addresses a file OR folder (song, album, or artist).
+        # Arpeggi uses id=album/... rather than the ID3-specific albumId.
         # Repeated GET and form POST parameters are allowed and applied atomically.
         selections = []
-        selections.extend(('song', song_id) for song_id in multi.get('id', []))
+        for item_id in multi.get('id', []):
+            if item_id.startswith('album/'):
+                kind = 'album'
+            elif item_id.startswith(('pub/', 'letter/')):
+                kind = 'artist'
+            else:
+                kind = 'song'
+            selections.append((kind, item_id))
         selections.extend(('album', album_id) for album_id in multi.get('albumId', []))
         selections.extend(('artist', artist_id_) for artist_id_ in multi.get('artistId', []))
         if not selections:

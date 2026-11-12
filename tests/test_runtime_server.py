@@ -347,6 +347,116 @@ class RuntimeServerTests(unittest.TestCase):
             self.assertIsNotNone(song_el.attrib.get('starred'))
             self.assertEqual(len(mod.user_stats.favorites('song')), 1)
 
+    def test_favorites_legacy_album_id_roundtrip(self):
+        # Arpeggi uses the Subsonic file/folder id parameter for albums.
+        mod = self.load_server({
+            'data_source': 'khinsider-live-v2', 'dataset_schema_version': 2,
+            'complete': True, 'legacy_inputs': [],
+            'albums': [{'slug': 'demo', 'title': 'Demo Album',
+                        'publishers': ['SEGA'], 'track_count': 1}],
+        })
+        client = TestClient(mod.app)
+        creds = {'u': 'admin', 'p': 'admin', 'f': 'json', 'c': 'Arpeggi'}
+        album_id = 'album/demo'
+        def api(endpoint, **params):
+            response = client.get('/rest/' + endpoint + '.view',
+                                  params=dict(creds, **params))
+            self.assertEqual(response.status_code, 200)
+            return response.json()['subsonic-response']
+        with mock.patch.object(mod, '_song_by_id', return_value=None) as song_lookup:
+            self.assertEqual(api('star', id=album_id)['status'], 'ok')
+            song_lookup.assert_not_called()
+            first = mod.user_stats.starred_at('album', album_id)
+            self.assertIsNotNone(first)
+            # Both request forms must address the same persisted favorite.
+            self.assertEqual(api('star', id=album_id, albumId=album_id)['status'], 'ok')
+            self.assertEqual(mod.user_stats.starred_at('album', album_id), first)
+            for endpoint, key in [('getStarred', 'starred'), ('getStarred2', 'starred2')]:
+                rows = api(endpoint)[key]
+                self.assertEqual([x['id'] for x in rows['album']], [album_id])
+                self.assertEqual(rows['album'][0]['starred'], first)
+                self.assertEqual(rows['song'], [])
+                self.assertEqual(rows['artist'], [])
+            for endpoint, key in [('getAlbumList', 'albumList'), ('getAlbumList2', 'albumList2')]:
+                self.assertEqual([x['id'] for x in api(endpoint, type='starred')[key]['album']],
+                                 [album_id])
+            self.assertEqual(mod.album_child('demo')['starred'], first)
+            from user_stats import UserStatsStore
+            self.assertEqual(UserStatsStore(mod.USER_STATS_PATH).starred_at('album', album_id), first)
+            unauth = client.get('/rest/unstar.view', params=dict(creds, p='wrong', id=album_id))
+            self.assertEqual(unauth.json()['subsonic-response']['status'], 'failed')
+            self.assertEqual(mod.user_stats.starred_at('album', album_id), first)
+            self.assertEqual(api('unstar', id=album_id)['status'], 'ok')
+            self.assertEqual(api('getStarred2')['starred2']['album'], [])
+            self.assertNotIn('starred', mod.album_child('demo'))
+            # Canonical adds and generic removes must interoperate as well.
+            self.assertEqual(api('star', albumId=album_id)['status'], 'ok')
+            self.assertEqual(api('unstar', id=album_id)['status'], 'ok')
+            self.assertEqual(mod.user_stats.favorites('album'), [])
+
+    def test_favorites_legacy_mixed_ids_form_post_and_atomic_validation(self):
+        mod = self.load_server({
+            'data_source': 'khinsider-live-v2', 'dataset_schema_version': 2,
+            'complete': True, 'legacy_inputs': [],
+            'albums': [{'slug': 'demo', 'title': 'Demo Album',
+                        'publishers': ['SEGA'], 'track_count': 1}],
+        })
+        client = TestClient(mod.app)
+        auth = [('u', 'admin'), ('p', 'admin'), ('f', 'json')]
+        song_id, album_id, artist_id = 'track/demo/1', 'album/demo', mod.pub_id('SEGA')
+        track = {'basename': 'demo.mp3', 'title': 'Demo Song', 'formats': ['mp3']}
+        def lookup(item_id):
+            if item_id == song_id:
+                return mod.song_child('demo', 'Demo Album', mod.ALBUMS['demo'], track, 1)
+            return None
+        def api(endpoint, pairs, post=False):
+            if post:
+                response = client.post('/rest/' + endpoint + '.view',
+                    content=urllib.parse.urlencode(auth + pairs).encode(),
+                    headers={'Content-Type': 'application/x-www-form-urlencoded'})
+            else:
+                response = client.get('/rest/' + endpoint + '.view', params=auth + pairs)
+            self.assertEqual(response.status_code, 200)
+            return response.json()['subsonic-response']
+        def snapshot():
+            return {kind: mod.user_stats.favorites(kind) for kind in ('song', 'album', 'artist')}
+        with mock.patch.object(mod, '_song_by_id', side_effect=lookup):
+            bad = api('star', [('id', song_id), ('id', 'album/not-real')])
+            self.assertEqual(bad['error']['message'], 'Album not found.')
+            self.assertEqual(snapshot(), {'song': [], 'album': [], 'artist': []})
+            mixed = [('id', song_id), ('id', album_id), ('id', artist_id),
+                     ('albumId', album_id), ('id', album_id)]
+            self.assertEqual(api('star', mixed, post=True)['status'], 'ok')
+            state = snapshot()
+            self.assertTrue(all(len(rows) == 1 for rows in state.values()))
+            self.assertEqual(api('star', mixed)['status'], 'ok')
+            self.assertEqual(snapshot(), state)
+            rows = api('getStarred2', [])['starred2']
+            self.assertEqual([x['id'] for x in rows['song']], [song_id])
+            self.assertEqual([x['id'] for x in rows['album']], [album_id])
+            self.assertEqual([x['id'] for x in rows['artist']], [artist_id])
+            # Explicitly typed parameters remain strict and mutations atomic.
+            self.assertEqual(api('unstar', [('id', album_id), ('albumId', song_id)])['status'], 'failed')
+            self.assertEqual(snapshot(), state)
+            self.assertEqual(api('star', [('artistId', album_id)])['status'], 'failed')
+            self.assertEqual(snapshot(), state)
+            self.assertEqual(api('star', [('id', 'pub/not-real')])['error']['message'],
+                             'Artist not found.')
+            self.assertEqual(snapshot(), state)
+            self.assertEqual(api('unstar', mixed, post=True)['status'], 'ok')
+            self.assertEqual(snapshot(), {'song': [], 'album': [], 'artist': []})
+
+    def test_favorites_legacy_letter_artist_ids(self):
+        mod = self.load_server({'albums': [{'slug': 'demo', 'title': 'Demo Album'}]})
+        client = TestClient(mod.app)
+        artist_id = mod._artist_entries()[0][0]
+        self.assertTrue(artist_id.startswith('letter/'))
+        params = {'u': 'admin', 'p': 'admin', 'f': 'json', 'id': artist_id}
+        for endpoint, expected_count in [('star', 1), ('unstar', 0)]:
+            response = client.get('/rest/' + endpoint + '.view', params=params)
+            self.assertEqual(response.json()['subsonic-response']['status'], 'ok')
+            self.assertEqual(len(mod.user_stats.favorites('artist')), expected_count)
+
     def test_favorites_migrate_existing_user_database(self):
         from user_stats import UserStatsStore
         import sqlite3

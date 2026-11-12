@@ -266,6 +266,9 @@ separate \`favorites\` table so upgrades do not remove any existing state.
 * \`star.view?albumId=album/<slug>\` and \`star.view?artistId=<artist-id>\`:
   independently star albums or artists. Unstar uses the same parameters.
   All three kinds of IDs can be combined in one GET or form POST request.
+* v0.6.2 also honors the original file/folder `id` parameter for albums
+  (`id=album/<slug>`) and artists (`id=pub/...` or `id=letter/...`).
+  This fixes Arpeggi album favorites; `unstar` accepts the same IDs.
 * \`getStarred.view\` / \`getStarred2.view\`: return the full saved artist,
   album and song lists, with each item's ISO-8601 \`starred\` timestamp.
 * Favorite timestamps also appear on song, album and artist objects when
