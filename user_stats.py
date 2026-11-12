@@ -1,10 +1,11 @@
-"""Persistent single-account ratings and playback history for the Subsonic relay.
+"""Persistent single-account media annotations and playback state.
 
 Track IDs are the stable Subsonic IDs (track/<album-slug>/<one-based-index>).
 Only scrobble submissions count as completed plays.  A "now playing" ping
 (submission=false) does not affect the library's listening statistics.
 """
 import datetime
+import json
 import os
 import sqlite3
 import threading
@@ -50,6 +51,17 @@ class UserStatsStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_favorites_time
                     ON favorites(starred_at_ms DESC);
+                CREATE TABLE IF NOT EXISTS play_queue (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    payload TEXT NOT NULL,
+                    changed_at_ms INTEGER NOT NULL,
+                    changed_by TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS now_playing (
+                    client TEXT PRIMARY KEY,
+                    song_id TEXT NOT NULL,
+                    started_at_ms INTEGER NOT NULL
+                );
             ''')
 
     @contextmanager
@@ -139,14 +151,17 @@ class UserStatsStore:
                         )
                 ''', (song_id, timestamp_ms))
 
-    def get(self, song_id):
+    def get(self, song_id, kind='song'):
+        """Annotations for a song or folder ID; existing song rows stay intact."""
+        if kind not in ('song', 'album', 'artist'):
+            raise ValueError('Invalid media kind.')
         with self.lock, self._conn() as db:
             row = db.execute('''
                 SELECT t.rating, t.play_count, t.last_played_ms, f.starred_at_ms
                 FROM (SELECT ? AS id) AS target
                 LEFT JOIN track_stats AS t ON t.song_id = target.id
-                LEFT JOIN favorites AS f ON f.kind = 'song' AND f.item_id = target.id
-            ''', (song_id,)).fetchone()
+                LEFT JOIN favorites AS f ON f.kind = ? AND f.item_id = target.id
+            ''', (song_id, kind)).fetchone()
         result = {}
         if row[0] is not None:
             result['userRating'] = row[0]
@@ -157,6 +172,81 @@ class UserStatsStore:
         if row[3] is not None:
             result['starred'] = _iso_time(row[3])
         return result
+
+    def album_activity(self):
+        """Aggregate completed plays and ratings without touching favorites."""
+        with self.lock, self._conn() as db:
+            rows = db.execute('''
+                SELECT song_id, rating, play_count, last_played_ms
+                FROM track_stats
+            ''').fetchall()
+        result = {}
+        for item_id, rating, count, played_ms in rows:
+            if item_id.startswith('album/'):
+                slug = item_id[len('album/'):]
+                item = result.setdefault(slug, {})
+                if rating is not None:
+                    item['albumRating'] = rating
+            elif item_id.startswith('track/') and '/' in item_id[len('track/'):]:
+                slug = item_id[len('track/'):].rsplit('/', 1)[0]
+                item = result.setdefault(slug, {})
+                item['playCount'] = item.get('playCount', 0) + count
+                if played_ms is not None:
+                    item['lastPlayedMs'] = max(item.get('lastPlayedMs', 0), played_ms)
+                if rating is not None:
+                    item['ratingSum'] = item.get('ratingSum', 0) + rating
+                    item['ratingCount'] = item.get('ratingCount', 0) + 1
+        for item in result.values():
+            item['rating'] = item.get('albumRating') or (
+                item.get('ratingSum', 0) / item['ratingCount']
+                if item.get('ratingCount') else 0)
+        return result
+
+    def save_queue(self, entries, current=None, position=None, changed_by=''):
+        payload = {'entry': entries}
+        if current is not None:
+            payload['current'] = current
+        if position is not None:
+            payload['position'] = position
+        with self.lock, self._conn() as db:
+            db.execute('''
+                INSERT INTO play_queue(singleton, payload, changed_at_ms, changed_by)
+                VALUES (1, ?, ?, ?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    payload=excluded.payload, changed_at_ms=excluded.changed_at_ms,
+                    changed_by=excluded.changed_by
+            ''', (json.dumps(payload, ensure_ascii=False),
+                  int(time.time() * 1000), changed_by))
+
+    def get_queue(self):
+        with self.lock, self._conn() as db:
+            row = db.execute('''
+                SELECT payload, changed_at_ms, changed_by
+                FROM play_queue WHERE singleton = 1
+            ''').fetchone()
+        if row is None:
+            return {'entry': [], 'changed': _iso_time(0), 'changedBy': ''}
+        payload = json.loads(row[0])
+        payload.update(changed=_iso_time(row[1]), changedBy=row[2])
+        return payload
+
+    def set_now_playing(self, client, song_id):
+        with self.lock, self._conn() as db:
+            db.execute('''
+                INSERT INTO now_playing(client, song_id, started_at_ms)
+                VALUES (?, ?, ?)
+                ON CONFLICT(client) DO UPDATE SET
+                    song_id=excluded.song_id, started_at_ms=excluded.started_at_ms
+            ''', (client, song_id, int(time.time() * 1000)))
+
+    def now_playing(self):
+        with self.lock, self._conn() as db:
+            rows = db.execute('''
+                SELECT client, song_id, started_at_ms
+                FROM now_playing ORDER BY started_at_ms DESC, client
+            ''').fetchall()
+        return [{'client': row[0], 'song_id': row[1], 'startedAtMs': row[2]}
+                for row in rows]
 
     def recent(self, limit=100, offset=0):
         limit = max(1, min(500, int(limit)))

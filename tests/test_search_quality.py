@@ -82,3 +82,11 @@ def test_rank_prefers_exact_then_phrase_then_word_match():
     assert rank_text('Jump up star', 'Jump Up, Super Star!') is not None
     assert rank_text('Aki safari', 'Ski Safari Theme') is not None
     assert rank_text('Aki safari', 'Unrelated Safari Theme') is None
+
+
+def test_album_counts_are_local_and_cached(monkeypatch, tmp_path):
+    mod = build_fixture_db(load_songs(tmp_path, monkeypatch), tmp_path)
+    counts = mod.album_counts()
+    assert counts['mario'] == 2
+    assert counts['other'] == 2
+    assert mod.album_counts() is counts

@@ -199,10 +199,24 @@ python3 scripts/build_song_index.py     # 曲名インデックス songs.tsv.gz 
 
 ## 対応エンドポイント
 
-ping / getLicense / getUser / getMusicFolders / getOpenSubsonicExtensions / getIndexes / getArtists / getArtist / getArtistInfo / getArtistInfo2 / getMusicDirectory / getAlbum / getAlbumInfo / getAlbumInfo2 / getAlbumList / getAlbumList2 / getGenres / getSongsByGenre / search2 / search3 / getSong / getCoverArt / stream / download / getPlaylists / getPlaylist / createPlaylist / updatePlaylist / deletePlaylist / scrobble / star / unstar / setRating / savePlayQueue / getStarred / getStarred2 / getScanStatus
+ping / getLicense / getUser / getMusicFolders / getOpenSubsonicExtensions / getIndexes / getArtists / getArtist / getArtistInfo / getArtistInfo2 / getMusicDirectory / getAlbum / getAlbumInfo / getAlbumInfo2 / getAlbumList / getAlbumList2 / getGenres / getSongsByGenre / search2 / search3 / getSong / getCoverArt / stream / download / getPlaylists / getPlaylist / createPlaylist / updatePlaylist / deletePlaylist / scrobble / star / unstar / setRating / savePlayQueue / getPlayQueue / getNowPlaying / getStarred / getStarred2 / getScanStatus
 
 - `search2` / `search3` はアルバム名・publisher 名・曲名を検索します。曲名側の仕組みと制限は「[曲名検索](#曲名検索)」を参照。
-- `getSongsByGenre` は空を返します。曲単位のジャンル閲覧には該当ジャンルの全アルバムページを取得する必要があるためです。ジャンルはアルバム単位で `getAlbumList2?type=byGenre` を使ってください。
+- `getSongsByGenre` と空クエリの `search2` / `search3` は曲をページングできます。カタログの曲数で前方のアルバムをスキップし、返すページに必要なアルバムだけライブ取得します。曲名検索インデックスを無効にしていても利用できます。
+
+## Subsonic compatibility fixes (v0.6.3)
+
+- 全REST APIで認証と必須の `u` / `v` / `c` を検証します。`p` または `t` + `s` が必要です。`ping` / `getLicense` も例外ではありません。API互換性は公式仕様どおり major/minor で判定し、patch は無視します。
+- アルバム一覧は必須の `songCount` / `duration` / `created` を常に返します。ローカルのアルバムキャッシュがあれば正確な曲数・合計秒数を使い、未取得の長さは `0`、不明な追加日は `1970-01-01T00:00:00.000Z` です。一覧取得だけで全アルバムをクロールすることはありません。
+- `setRating` は曲・アルバム・アーティストのIDに対応します。フォルダーの評価と♥は `getMusicDirectory` にも反映され、既存の曲の評価・履歴・お気に入りは保持されます。
+- アルバム一覧の `recent` / `frequent` は完了scrobble、`highest`（旧 `getAlbumList`）は評価を使います。`highest` はアルバムへの明示評価を優先し、それが無ければ曲の評価の平均を使います。`alphabeticalByArtist` はアーティスト名順です。
+- `savePlayQueue` / `getPlayQueue` は曲順・重複・現在曲ID・再生位置（ミリ秒）を永続化します。`/data/user_data.sqlite` に追加テーブルを作るだけで、既存テーブルの削除や再作成はしません。空のキューを保存するとクリアされます。
+- `scrobble?submission=false` は履歴や再生回数を増やさず、`getNowPlaying` で取得できる状態を更新します。表示期間は曲の長さ+1分または10分の長い方です。
+- `getAlbumInfo2` は正しい `albumInfo` キーを返し、アルバム・アーティスト情報のXML文字列は子要素として返します。旧 `getAlbumInfo` は曲IDにも対応します。
+- JSONPは検証済みの `callback` でラップします。`stream` / `download` / `getCoverArt` のエラーは `f` にかかわらずXMLです。既存の音声Range/HEAD転送とCloudflare復旧は維持します。
+- `getCoverArt` は曲・アルバム・アーティストIDと `size=1..4096` に対応し、縦横比を維持して縮小します。サイズ未指定時は元画像を返します。
+- `musicFolderId` の絞り込みと `getIndexes?ifModifiedSince` に対応します。変更が無ければ `indexes` を省略し、`lastModified` は起動時刻ではなくライブラリファイルの更新時刻を使います。
+- `getGenres` の曲数はカタログ、ローカルキャッシュ、利用可能な曲名インデックスの順に補完します。すべてに情報が無いアルバムは0扱いです。`getRandomSongs` / ブックマーク / 歌詞 / `startScan` は引き続き未対応としてエラーを返します。
 
 ## 注意点
 

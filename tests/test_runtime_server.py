@@ -158,7 +158,7 @@ class RuntimeServerTests(unittest.TestCase):
         mod = self.load_server()
         song_id = 'track/demo/1'
         client = TestClient(mod.app)
-        creds = {'u': 'admin', 'p': 'admin', 'f': 'json'}
+        creds = {'v': '1.16.1', 'c': 'test', 'u': 'admin', 'p': 'admin', 'f': 'json'}
         def ok(endpoint, **params):
             reply = client.get('/rest/' + endpoint, params=dict(creds, **params))
             self.assertEqual(reply.status_code, 200)
@@ -181,7 +181,7 @@ class RuntimeServerTests(unittest.TestCase):
             ok('setRating', id=song_id, rating=0)
             self.assertNotIn('userRating', mod.user_stats.get(song_id))
             ok('setRating', id=song_id, rating=4)
-            unauthorized = client.get('/rest/setRating', params={'u':'other','p':'wrong','f':'json','id':song_id,'rating':3})
+            unauthorized = client.get('/rest/setRating', params={'v': '1.16.1', 'c': 'test', 'u':'other','p':'wrong','f':'json','id':song_id,'rating':3})
             self.assertEqual(unauthorized.json()['subsonic-response']['status'], 'failed')
             self.assertEqual(mod.user_stats.get(song_id)['userRating'], 4)
 
@@ -197,7 +197,7 @@ class RuntimeServerTests(unittest.TestCase):
     def test_scrobble_history_counts_timestamps_and_multi_song_batch(self):
         mod = self.load_server()
         client = TestClient(mod.app)
-        creds = {'u':'admin', 'p':'admin', 'f':'json'}
+        creds = {'v': '1.16.1', 'c': 'test', 'u':'admin', 'p':'admin', 'f':'json'}
         ids = ('track/demo/1', 'track/demo/2')
         def mocked_song(song):
             return {'id': song, 'title': 'Song'} if song in ids else None
@@ -212,7 +212,7 @@ class RuntimeServerTests(unittest.TestCase):
             self.assertEqual(mod.user_stats.get(ids[0])['playCount'], 1)
             self.assertEqual(mod.user_stats.get(ids[0])['played'], '2024-10-27T03:33:20.000Z')
             later = first + 10000
-            batch = [('u','admin'),('p','admin'),('f','json'),
+            batch = [('v', '1.16.1'), ('c', 'test'), ('u','admin'),('p','admin'),('f','json'),
                      ('id', ids[0]),('id',ids[1]),('time',str(later)),('time',str(first-1000))]
             response = client.post('/rest/scrobble.view', content=urllib.parse.urlencode(batch).encode(),
                                    headers={'Content-Type':'application/x-www-form-urlencoded'})
@@ -227,7 +227,7 @@ class RuntimeServerTests(unittest.TestCase):
             self.assertEqual(req('getRecentlyPlayed', {'count': 1, 'offset':1})['playHistory']['entry'][0]['id'], ids[0])
 
             before = mod.user_stats.get(ids[0])['playCount']
-            malformed = [('u','admin'),('p','admin'),('f','json'),
+            malformed = [('v', '1.16.1'), ('c', 'test'), ('u','admin'),('p','admin'),('f','json'),
                          ('id', ids[0]),('id',ids[1]),('time','1')]
             self.assertEqual(client.post('/rest/scrobble', content=urllib.parse.urlencode(malformed).encode(),
                                          headers={'Content-Type':'application/x-www-form-urlencoded'}).json()['subsonic-response']['status'], 'failed')
@@ -255,7 +255,7 @@ class RuntimeServerTests(unittest.TestCase):
         }
         mod = self.load_server(payload)
         client = TestClient(mod.app)
-        creds = {'u': 'admin', 'p': 'admin', 'f': 'json'}
+        creds = {'v': '1.16.1', 'c': 'test', 'u': 'admin', 'p': 'admin', 'f': 'json'}
         song_id = 'track/demo/1'
         album_id = 'album/demo'
         artist_id = mod.pub_id('SEGA')
@@ -308,7 +308,7 @@ class RuntimeServerTests(unittest.TestCase):
             bad = api('star', {'id':song_id, 'albumId':'album/not-real'})
             self.assertEqual(bad['status'], 'failed')
             self.assertEqual(mod.user_stats.starred_at('song', song_id), first)
-            unauth = client.get('/rest/unstar.view', params={
+            unauth = client.get('/rest/unstar.view', params={'v': '1.16.1', 'c': 'test',
                 'u':'wrong', 'p':'wrong', 'f':'json', 'id':song_id})
             self.assertEqual(unauth.json()['subsonic-response']['status'], 'failed')
             self.assertEqual(mod.user_stats.starred_at('song', song_id), first)
@@ -332,14 +332,14 @@ class RuntimeServerTests(unittest.TestCase):
             self.assertEqual(api('getAlbumList2', {'type':'starred'})['albumList2']['album'], [])
 
             # POST accepts repeated song IDs, XML response contains the starred attribute.
-            body = [('u','admin'),('p','admin'),('id',song_id),('id',song_id),
+            body = [('v', '1.16.1'), ('c', 'test'), ('u','admin'),('p','admin'),('id',song_id),('id',song_id),
                     ('albumId',album_id)]
             response = client.post('/rest/star.view',
                 content=urllib.parse.urlencode(body).encode(),
                 headers={'Content-Type':'application/x-www-form-urlencoded'})
             self.assertEqual(response.status_code, 200)
             self.assertIn(b'status="ok"', response.content)
-            xml = client.get('/rest/getStarred.view', params={'u':'admin','p':'admin'})
+            xml = client.get('/rest/getStarred.view', params={'v': '1.16.1', 'c': 'test', 'u':'admin','p':'admin'})
             import xml.etree.ElementTree as ET
             root = ET.fromstring(xml.content)
             song_el = root.find('.//{*}song')
@@ -356,7 +356,7 @@ class RuntimeServerTests(unittest.TestCase):
                         'publishers': ['SEGA'], 'track_count': 1}],
         })
         client = TestClient(mod.app)
-        creds = {'u': 'admin', 'p': 'admin', 'f': 'json', 'c': 'Arpeggi'}
+        creds = {'v': '1.16.1', 'u': 'admin', 'p': 'admin', 'f': 'json', 'c': 'Arpeggi'}
         album_id = 'album/demo'
         def api(endpoint, **params):
             response = client.get('/rest/' + endpoint + '.view',
@@ -402,7 +402,7 @@ class RuntimeServerTests(unittest.TestCase):
                         'publishers': ['SEGA'], 'track_count': 1}],
         })
         client = TestClient(mod.app)
-        auth = [('u', 'admin'), ('p', 'admin'), ('f', 'json')]
+        auth = [('v', '1.16.1'), ('c', 'test'), ('u', 'admin'), ('p', 'admin'), ('f', 'json')]
         song_id, album_id, artist_id = 'track/demo/1', 'album/demo', mod.pub_id('SEGA')
         track = {'basename': 'demo.mp3', 'title': 'Demo Song', 'formats': ['mp3']}
         def lookup(item_id):
@@ -451,7 +451,7 @@ class RuntimeServerTests(unittest.TestCase):
         client = TestClient(mod.app)
         artist_id = mod._artist_entries()[0][0]
         self.assertTrue(artist_id.startswith('letter/'))
-        params = {'u': 'admin', 'p': 'admin', 'f': 'json', 'id': artist_id}
+        params = {'v': '1.16.1', 'c': 'test', 'u': 'admin', 'p': 'admin', 'f': 'json', 'id': artist_id}
         for endpoint, expected_count in [('star', 1), ('unstar', 0)]:
             response = client.get('/rest/' + endpoint + '.view', params=params)
             self.assertEqual(response.json()['subsonic-response']['status'], 'ok')
@@ -504,7 +504,7 @@ class RuntimeServerTests(unittest.TestCase):
         for idx in (1, 2):
             resp = client.get(
                 '/rest/stream',
-                params={'u': 'admin', 'p': 'admin', 'id': f'track/va-2024/{idx}'},
+                params={'v': '1.16.1', 'c': 'test', 'u': 'admin', 'p': 'admin', 'id': f'track/va-2024/{idx}'},
                 follow_redirects=False,
             )
             self.assertEqual(resp.status_code, 302)
@@ -852,7 +852,7 @@ class RuntimeServerTests(unittest.TestCase):
             'albums': [{'slug': 'album-%d' % i,
                         'title': 'Soundtrack %02d' % i,
                         'publishers': ['Publisher %02d' % i],
-                        'platforms': ['3DS']} for i in range(6)],
+                        'platforms': ['3DS'], 'track_count': 0} for i in range(6)],
         }
         mod = self.load_server(library=library)
         creds = {'u': 'admin', 'p': 'admin', 'v': '1.16.1', 'c': 'test', 'f': 'json'}
@@ -892,9 +892,8 @@ class RuntimeServerTests(unittest.TestCase):
             self.assertEqual(len(set(titles)), 6)
             self.assertEqual(titles, sorted(titles, key=str.lower))
 
-            missing = search(artistCount=2, albumCount=2, songCount=0)
-            self.assertEqual(len(missing['artist']), 2)
-            self.assertEqual(len(missing['album']), 2)
+            missing = client.get('/rest/search3.view', params=creds)
+            self.assertEqual(missing.json()['subsonic-response']['error']['code'], 10)
 
             no_songs = search(query='', artistCount=0, albumCount=0, songCount=50)
             self.assertEqual(no_songs['song'], [])
@@ -1069,7 +1068,7 @@ class RuntimeServerTests(unittest.TestCase):
         with mock.patch.object(module.page_fetcher, '_solve',
                                return_value=(DummyResponse(text=html), {})) as solve:
             r = TestClient(module.app).get('/rest/stream.view',
-                params={'u':'admin','p':'admin','id':'track/demo/1'}, follow_redirects=False)
+                params={'v': '1.16.1', 'c': 'test', 'u':'admin','p':'admin','id':'track/demo/1'}, follow_redirects=False)
         self.assertEqual(r.status_code, 302)
         self.assertEqual(r.headers['location'], mp3)
         self.assertTrue(Path(module._cache_path('albums', 'demo')).exists())
@@ -1081,10 +1080,11 @@ class RuntimeServerTests(unittest.TestCase):
         module.sess = FakeSession({url: DummyResponse(status_code=403,
                                       headers={'cf-mitigated': 'challenge'})})
         r = TestClient(module.app).get('/rest/stream.view',
-             params={'u':'admin','p':'admin','id':'track/demo/1','f':'json'})
+             params={'v': '1.16.1', 'c': 'test', 'u':'admin','p':'admin','id':'track/demo/1','f':'json'})
         self.assertEqual(r.status_code, 503)
         self.assertEqual(r.headers['retry-after'], '15')
-        self.assertEqual(r.json()['subsonic-response']['error']['code'], 0)
+        import xml.etree.ElementTree as ET
+        self.assertEqual(ET.fromstring(r.content).find('{*}error').attrib['code'], '0')
         self.assertFalse(Path(module._cache_path('albums', 'demo')).exists())
 
     def test_stale_album_is_preserved_when_upstream_is_blocked(self):
@@ -1121,7 +1121,7 @@ class RuntimeServerTests(unittest.TestCase):
             'Content-Type':'audio/mpeg','Content-Length':str(len(data)),
             'Content-Range':'bytes 50-84/1000','Accept-Ranges':'bytes','ETag':'test'})
         module,client,url = self.proxy_fixture(source)
-        r = client.get('/rest/stream.view', params={'u':'admin','p':'admin',
+        r = client.get('/rest/stream.view', params={'v': '1.16.1', 'c': 'test', 'u':'admin','p':'admin',
             'id':'track/demo/1','proxy':'1'}, headers={
                 'Range':'bytes=50-84','If-Range':'test','Accept-Encoding':'gzip'})
         self.assertEqual(r.status_code, 206)
@@ -1138,7 +1138,7 @@ class RuntimeServerTests(unittest.TestCase):
         source = DummyResponse(headers={'Content-Type':'audio/mpeg','Content-Length':'12345',
                                          'Accept-Ranges':'bytes'})
         module,client,url = self.proxy_fixture(source)
-        r = client.head('/rest/stream.view', params={'u':'admin','p':'admin',
+        r = client.head('/rest/stream.view', params={'v': '1.16.1', 'c': 'test', 'u':'admin','p':'admin',
             'id':'track/demo/1','proxy':'1'})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.content, b'')
@@ -1150,7 +1150,7 @@ class RuntimeServerTests(unittest.TestCase):
     def test_proxy_never_returns_html_as_successful_audio(self):
         source = DummyResponse(text='<html>error</html>', headers={'Content-Type':'text/html'})
         module,client,url = self.proxy_fixture(source)
-        r = client.get('/rest/stream.view', params={'u':'admin','p':'admin',
+        r = client.get('/rest/stream.view', params={'v': '1.16.1', 'c': 'test', 'u':'admin','p':'admin',
             'id':'track/demo/1','proxy':'1','f':'json'})
         self.assertEqual(r.status_code, 503)
         self.assertNotIn('audio/', r.headers['content-type'])
@@ -1160,7 +1160,7 @@ class RuntimeServerTests(unittest.TestCase):
         source = DummyResponse(status_code=416, content=b'bad range', headers={
             'Content-Range':'bytes */1000','Content-Length':'9'})
         module,client,url = self.proxy_fixture(source)
-        r = client.get('/rest/stream.view', params={'u':'admin','p':'admin',
+        r = client.get('/rest/stream.view', params={'v': '1.16.1', 'c': 'test', 'u':'admin','p':'admin',
             'id':'track/demo/1','proxy':'1'}, headers={'Range':'bytes=2000-'})
         self.assertEqual(r.status_code, 416)
         self.assertEqual(r.headers['content-range'], 'bytes */1000')
@@ -1176,7 +1176,7 @@ class RuntimeServerTests(unittest.TestCase):
         module.sess.routes[fresh_url] = fresh
         with mock.patch.object(module, '_resolve_track_page',
                                return_value={'files':{'mp3':fresh_url}}) as resolve:
-            r = client.get('/rest/stream.view', params={'u':'admin','p':'admin',
+            r = client.get('/rest/stream.view', params={'v': '1.16.1', 'c': 'test', 'u':'admin','p':'admin',
                 'id':'track/demo/1','proxy':'1'})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.content, b'ID3new-audio')

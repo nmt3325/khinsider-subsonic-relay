@@ -59,6 +59,7 @@ _HASH_RE = re.compile(r'^[0-9a-f]{64}$')
 _lock = threading.Lock()        # sqlite connections are not thread-safe
 _build_lock = threading.Lock()  # at most one download/build at a time
 _conn = None
+_album_counts_cache = (None, {})
 _retired = []                   # superseded connections, closed one cycle later
 _state = {'state': 'disabled' if SONG_SEARCH == 'off' else 'idle',
           'rows': 0, 'built': None, 'checked': None, 'error': None}
@@ -722,6 +723,19 @@ def candidates(query, limit=None):
     ranked.sort(key=lambda row: (row[0], row[1], row[2], row[4] or 0, row[5]))
     return [(album, disc, number, title)
             for _, _, album, disc, number, title in ranked[:maximum]]
+
+def album_counts():
+    """A cached local count per album, also usable while offline."""
+    global _album_counts_cache
+    con = _ensure()
+    if con is None:
+        return {}
+    with _lock:
+        if _album_counts_cache[0] is not con:
+            counts = dict(con.execute('SELECT album, count(*) FROM song GROUP BY album'))
+            _album_counts_cache = (con, counts)
+        return _album_counts_cache[1]
+
 
 def search(query, count=20, offset=0):
     """Subsonic song dicts for search2/search3, resolved against live pages."""

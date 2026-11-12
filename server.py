@@ -67,7 +67,9 @@ Config (env):
 """
 import gzip
 import hashlib
+import hmac
 import inspect
+import io
 import json
 import os
 import random
@@ -84,6 +86,7 @@ from bs4.element import Comment, NavigableString, Tag
 from curl_cffi import requests as creq
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from PIL import Image, ImageOps, UnidentifiedImageError
 from khinsider_player import extract_player_urls, valid_mp3_url
 from khinsider_http import PageFetcher, UpstreamUnavailable
 from starlette.concurrency import run_in_threadpool
@@ -103,7 +106,7 @@ else:
 BASE = 'https://downloads.khinsider.com'
 API_VERSION = '1.16.1'
 SERVER_TYPE = 'khinsider-relay'
-SERVER_VERSION = '0.6.2'
+SERVER_VERSION = '0.6.3'
 USERNAME = os.environ.get('SUBSONIC_USER', 'admin')
 PASSWORD = os.environ.get('SUBSONIC_PASSWORD', 'admin')
 CACHE_DIR = os.environ.get('CACHE_DIR', './cache')
@@ -269,7 +272,9 @@ def normalize_meta(a):
     if not album_type and a.get('genres') is not None:
         vals = _as_list(a.get('genres'))
         album_type = vals[0] if vals else None
-    track_count = a.get('track_count') or a.get('songCount')
+    track_count = a.get('track_count')
+    if track_count is None:
+        track_count = a.get('songCount')
     if track_count is None and isinstance(a.get('tracks'), int):
         track_count = a.get('tracks')
     meta = {
@@ -282,7 +287,9 @@ def normalize_meta(a):
         'album_type': album_type or None,
         'date_added': a.get('date_added') or a.get('dateAdded'),
         'catalog_number': a.get('catalog_number') or a.get('catalogNumber'),
-        'track_count': track_count if isinstance(track_count, int) else None,
+        'track_count': (track_count if isinstance(track_count, int)
+                        and not isinstance(track_count, bool) and track_count >= 0 else None),
+        'duration': a.get('duration') or a.get('total_duration'),
     }
     return meta
 
@@ -525,7 +532,8 @@ def build_library_indexes(lib):
     NEWEST_SLUGS = sorted((s for s, m in albums.items() if m.get('date_added')),
                           key=lambda s: albums[s]['date_added'], reverse=True)
     LIB_META_ALBUMS = meta_albums
-    LIBRARY_BUILT = time.time()
+    # This is a collection modification timestamp, not a request/startup clock.
+    LIBRARY_BUILT = os.path.getmtime(LIBRARY_PATH) if os.path.exists(LIBRARY_PATH) else time.time()
     print(f'library loaded: {len(ALBUMS)} albums in {len(LETTERS)} sections, '
           f'{LIB_META_ALBUMS} with metadata, {len(PUBLISHERS)} publishers, {len(GENRES)} genres '
           f'(artists = {"publisher" if USE_PUB_ARTISTS else "letter"})')
@@ -581,9 +589,10 @@ def check_auth(q):
                 p = bytes.fromhex(p[4:]).decode('utf-8', 'replace')
             except ValueError:
                 return False
-        return p == PASSWORD
+        return hmac.compare_digest(p.encode(), PASSWORD.encode())
     if t and s:
-        return hashlib.md5((PASSWORD + s).encode()).hexdigest() == t.lower()
+        return hmac.compare_digest(hashlib.md5((PASSWORD + s).encode()).hexdigest().encode(),
+                                   t.lower().encode())
     return False
 
 
@@ -598,12 +607,27 @@ def _tags(nodes, name):
     return out
 
 
+XML_TEXT_FIELDS = {
+    'albumInfo': ('notes', 'musicBrainzId', 'lastFmUrl', 'smallImageUrl',
+                  'mediumImageUrl', 'largeImageUrl'),
+    'artistInfo': ('biography', 'musicBrainzId', 'lastFmUrl', 'smallImageUrl',
+                   'mediumImageUrl', 'largeImageUrl'),
+    'artistInfo2': ('biography', 'musicBrainzId', 'lastFmUrl', 'smallImageUrl',
+                    'mediumImageUrl', 'largeImageUrl'),
+}
+
+
 def _fill(el, value):
     """Render a python value into an XML element (attributes + children)."""
     if isinstance(value, dict):
         for k, v in value.items():
             if k == '_text':
                 el.text = str(v)
+            elif k == 'value' and '_text' in value:
+                # Genre's JSON "value" is XML text, never an XML attribute.
+                continue
+            elif k in XML_TEXT_FIELDS.get(el.tag.rsplit('}', 1)[-1], ()) and v is not None:
+                ET.SubElement(el, k).text = str(v)
             elif isinstance(v, dict):
                 _fill(ET.SubElement(el, k), v)
             elif isinstance(v, list):
@@ -641,14 +665,19 @@ def _json_prep(value):
 
 
 def respond(payload, fmt, status='ok', error=None):
-    if fmt == 'json':
+    if fmt == 'json' or isinstance(fmt, tuple):
         body = {'status': status, 'version': API_VERSION, 'type': SERVER_TYPE,
                 'serverVersion': SERVER_VERSION, 'openSubsonic': True}
         if error:
             body['error'] = _json_prep(error)
         else:
             body.update(_json_prep(payload or {}))
-        return JSONResponse({'subsonic-response': body})
+        data = {'subsonic-response': body}
+        if isinstance(fmt, tuple):
+            encoded = json.dumps(data, ensure_ascii=True, separators=(',', ':'))
+            return Response('%s(%s);' % (fmt[1], encoded),
+                            media_type='application/javascript')
+        return JSONResponse(data)
     root = ET.Element('subsonic-response', {
         'xmlns': SUBSONIC_NS, 'status': status, 'version': API_VERSION,
         'type': SERVER_TYPE, 'serverVersion': SERVER_VERSION, 'openSubsonic': 'true'})
@@ -663,6 +692,42 @@ def respond(payload, fmt, status='ok', error=None):
 
 def sub_error(fmt, code, message):
     return respond(None, fmt, status='failed', error={'code': code, 'message': message})
+
+
+def _response_format(q, ep):
+    # Binary endpoints always report protocol errors as XML, even with f=json.
+    if ep in ('stream', 'download', 'getCoverArt'):
+        return 'xml'
+    if q.get('f') == 'jsonp':
+        callback = q.get('callback', '')
+        if len(callback) <= 200 and re.fullmatch(
+                r'[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*', callback):
+            return ('jsonp', callback)
+        return 'json'
+    return 'json' if q.get('f') == 'json' else 'xml'
+
+
+def _common_error(q, ep=''):
+    for key in ('u', 'v', 'c'):
+        if not q.get(key):
+            return 10, 'Required parameter %s is missing.' % key
+    if q.get('p') is None and not (q.get('t') and q.get('s')):
+        return 10, 'Password or token and salt are required.'
+    if not check_auth(q):
+        return 40, 'Wrong username or password.'
+    version = re.fullmatch(r'(\d+)\.(\d+)(?:\.\d+)?', q['v'])
+    if not version:
+        return 10, 'Invalid API version.'
+    major, minor = map(int, version.groups())
+    supported_major, supported_minor = map(int, API_VERSION.split('.')[:2])
+    if major < supported_major:
+        return 20, 'Client API version is too old.'
+    if major > supported_major or minor > supported_minor:
+        return 30, 'Server API version is too old.'
+    if (ep not in ('stream', 'download', 'getCoverArt') and q.get('f') == 'jsonp'
+            and not isinstance(_response_format(q, ''), tuple)):
+        return 10, 'A valid JSONP callback is required.'
+    return None
 
 # ---------------- page cache ----------------
 
@@ -1194,6 +1259,12 @@ def apply_meta(d, meta):
 
 def album_child(slug, parent=None, album=None):
     """Album as a directory child / album list entry."""
+    # Lists must not crawl the catalogue to fill mandatory ID3 attributes.
+    # Zero/epoch mean metadata is not known yet; detail calls return live values.
+    if album is None:
+        cached = _cache_get('albums', slug)
+        if cached and cached.get('v') == ALBUM_CACHE_VERSION:
+            album = cached
     meta = album_meta(slug, album)
     d = {
         'id': 'album/' + slug,
@@ -1205,11 +1276,15 @@ def album_child(slug, parent=None, album=None):
         'coverArt': 'album/' + slug,
     }
     apply_meta(d, meta)
-    starred = user_stats.starred_at('album', d['id'])
-    if starred:
-        d['starred'] = starred
-    if meta.get('track_count'):
-        d['songCount'] = meta['track_count']
+    d.update(user_stats.get(d['id'], 'album'))
+    d['songCount'] = len(album.get('tracks') or []) if album is not None else (meta.get('track_count') or 0)
+    duration = (sum(int(t.get('duration') or 0) for t in (album.get('tracks') or []))
+                if album is not None else meta.get('duration'))
+    try:
+        d['duration'] = max(0, int(duration or 0))
+    except (ValueError, TypeError):
+        d['duration'] = 0
+    d.setdefault('created', '1970-01-01T00:00:00.000Z')
     return d
 
 
@@ -1259,6 +1334,64 @@ def _song_by_id(song_id):
         return None
     meta = album_meta(slug, album)
     return song_child(slug, album['title'], meta, album['tracks'][idx - 1], idx)
+
+
+def _media_id(item_id):
+    """Resolve a file/folder ID to its canonical annotation key."""
+    if item_id.startswith('album/'):
+        return ('album', item_id) if item_id[len('album/'):] in ALBUMS else None
+    if item_id.startswith(('pub/', 'letter/')):
+        if not _albums_for_artist(item_id):
+            return None
+        canonical = (pub_id(_publisher_name(item_id)) if item_id.startswith('pub/')
+                     else 'letter/' + item_id[len('letter/'):].upper())
+        return 'artist', canonical
+    song = _song_by_id(item_id)
+    return ('song', song['id']) if song is not None else None
+
+
+def _known_track_count(slug):
+    """Use catalogue/index counts for skipping, without fetching album pages."""
+    count = ALBUMS.get(slug, {}).get('track_count')
+    if count is not None:
+        return count
+    cached = _cache_get('albums', slug)
+    if cached and cached.get('v') == ALBUM_CACHE_VERSION:
+        return len(cached.get('tracks') or [])
+    counts = getattr(song_index, 'album_counts', None)
+    return counts().get(slug) if callable(counts) else None
+
+
+def _catalog_songs(slugs, count, offset=0):
+    """Page actual songs with stable stream IDs, loading only needed albums.
+
+    Unlike title search this has no candidate/album cap, so callers can walk
+    the whole library even when the optional title index is disabled.
+    """
+    if count <= 0:
+        return []
+    out = []
+    remaining = max(0, offset)
+    for slug in slugs:
+        known = _known_track_count(slug)
+        if known is not None and remaining >= known:
+            remaining -= known
+            continue
+        album = load_album(slug)
+        if not album:
+            continue
+        tracks = album.get('tracks') or []
+        if remaining >= len(tracks):
+            remaining -= len(tracks)
+            continue
+        meta = album_meta(slug, album)
+        take = min(len(tracks), remaining + count - len(out))
+        out.extend(song_child(slug, album['title'], meta, tracks[i], i + 1)
+                   for i in range(remaining, take))
+        remaining = 0
+        if len(out) >= count:
+            break
+    return out
 
 
 def _playlist_stored_song(song_id):
@@ -1418,9 +1551,7 @@ def artist_child(artist_id_, name, count, image=None, albums=None):
         d['coverArt'] = cover
         if image:
             d['artistImageUrl'] = image(cover)
-    starred = user_stats.starred_at('artist', artist_id_)
-    if starred:
-        d['starred'] = starred
+    d.update(user_stats.get(artist_id_, 'artist'))
     return d
 
 
@@ -1481,7 +1612,8 @@ async def subsonic(endpoint: str, request: Request):
         return await run_in_threadpool(_subsonic_dispatch, endpoint, request, q, multi)
     except UpstreamUnavailable as exc:
         print('upstream temporarily unavailable: %s' % exc, flush=True)
-        fmt = 'json' if q.get('f') in ('json', 'jsonp') else 'xml'
+        ep = endpoint[:-5] if endpoint.endswith('.view') else endpoint
+        fmt = _response_format(q, ep)
         response = sub_error(fmt, 0, 'KHInsider is temporarily unavailable. Please retry shortly.')
         response.status_code = 503
         response.headers['Retry-After'] = '15'
@@ -1489,11 +1621,28 @@ async def subsonic(endpoint: str, request: Request):
 
 
 def _subsonic_dispatch(endpoint, request, q, multi):
-    fmt = 'json' if q.get('f') in ('json', 'jsonp') else 'xml'
     ep = endpoint[:-5] if endpoint.endswith('.view') else endpoint
+    fmt = _response_format(q, ep)
 
-    if ep not in ('ping', 'getLicense') and not check_auth(q):
-        return sub_error(fmt, 40, 'Wrong username or password.')
+    error = _common_error(q, ep)
+    if error:
+        return sub_error(fmt, *error)
+    required = {
+        'getUser': ('username',),
+        'getArtist': ('id',), 'getArtistInfo': ('id',), 'getArtistInfo2': ('id',),
+        'getMusicDirectory': ('id',), 'getAlbum': ('id',),
+        'getAlbumInfo': ('id',), 'getAlbumInfo2': ('id',),
+        'getSong': ('id',), 'getCoverArt': ('id',),
+        'stream': ('id',), 'download': ('id',),
+        'getAlbumList': ('type',), 'getAlbumList2': ('type',),
+        'getSongsByGenre': ('genre',), 'setRating': ('id', 'rating'),
+        'search2': ('query',), 'search3': ('query',),
+    }
+    for key in required.get(ep, ()):
+        # Empty queries are explicitly supported for OpenSubsonic full sync.
+        if key not in q or (key != 'query' and q[key] == ''):
+            return sub_error(fmt, 10, 'Required parameter %s is missing.' % key)
+    folder_ok = q.get('musicFolderId') in (None, '', '0')
 
     if ep == 'ping':
         return respond({}, fmt)
@@ -1502,6 +1651,8 @@ def _subsonic_dispatch(endpoint, request, q, multi):
         return respond({'license': {'valid': True, 'email': 'nobody@example.com'}}, fmt)
 
     if ep == 'getUser':
+        if q['username'] != USERNAME:
+            return sub_error(fmt, 50, 'Not authorized to access another user.')
         return respond({'user': {
             'username': USERNAME, 'email': 'nobody@example.com', 'scrobblingEnabled': False,
             'adminRole': False, 'settingsRole': False, 'downloadRole': True,
@@ -1520,17 +1671,25 @@ def _subsonic_dispatch(endpoint, request, q, multi):
         # folder view: the same browsable artists as the ID3 view, so a
         # folder-mode client is not stuck with 27 alphabet buckets.
         # letter/ ids stay valid in getMusicDirectory for old bookmarks.
+        modified = int(LIBRARY_BUILT * 1000)
+        if 'ifModifiedSince' in q:
+            try:
+                since = int(q['ifModifiedSince'])
+            except (ValueError, TypeError):
+                return sub_error(fmt, 10, 'Invalid ifModifiedSince timestamp.')
+            if since >= modified:
+                return respond({}, fmt)
         return respond({'indexes': {
-            'lastModified': int(time.time() * 1000),
+            'lastModified': modified,
             'ignoredArticles': 'The El La Los Las Le Les',
-            'index': _artist_index(_image_url(request, q)),
+            'index': _artist_index(_image_url(request, q)) if folder_ok else [],
         }}, fmt)
 
     if ep == 'getArtists':
         # ID3 view: publishers become album artists when the library has them
         return respond({'artists': {
             'ignoredArticles': 'The El La Los Las Le Les',
-            'index': _artist_index(_image_url(request, q)),
+            'index': _artist_index(_image_url(request, q)) if folder_ok else [],
         }}, fmt)
 
     if ep == 'getArtist':
@@ -1546,7 +1705,17 @@ def _subsonic_dispatch(endpoint, request, q, multi):
 
     if ep == 'getArtistInfo' or ep == 'getArtistInfo2':
         key = 'artistInfo' if ep == 'getArtistInfo' else 'artistInfo2'
-        rows = _albums_for_artist(q.get('id', ''))
+        aid = q['id']
+        if ep == 'getArtistInfo' and aid.startswith(('album/', 'track/')):
+            slug = (aid[len('album/'):] if aid.startswith('album/')
+                    else aid[len('track/'):].rsplit('/', 1)[0])
+            album = load_album(slug)
+            if not album:
+                return sub_error(fmt, 70, 'Artist not found.')
+            aid = artist_id(album_meta(slug, album)) or ''
+        rows = _albums_for_artist(aid)
+        if not rows:
+            return sub_error(fmt, 70, 'Artist not found.')
         info = {'biography': '', 'musicBrainzId': '', 'lastFmUrl': ''}
         image = _image_url(request, q)
         if rows and image:
@@ -1564,35 +1733,43 @@ def _subsonic_dispatch(endpoint, request, q, multi):
                 return sub_error(fmt, 70, 'Directory not found.')
             name = (_publisher_name(did) if did.startswith('pub/')
                     else urllib.parse.unquote(did.split('/', 1)[1]))
-            return respond({'directory': {
+            directory = {
                 'id': did, 'parent': '0', 'name': name,
                 'child': [album_child(slug, parent=did) for slug, _ in rows],
-            }}, fmt)
+            }
+            canonical = pub_id(name) if did.startswith('pub/') else 'letter/' + did.split('/', 1)[1].upper()
+            directory.update(user_stats.get(canonical, 'artist'))
+            return respond({'directory': directory}, fmt)
         if did.startswith('album/'):
             slug = did[len('album/'):]
             album = load_album(slug)
             if not album:
                 return sub_error(fmt, 70, 'Album not found.')
             meta = album_meta(slug, album)
-            return respond({'directory': {
+            directory = {
                 'id': did, 'parent': 'letter/' + meta.get('letter', '0-9'),
                 'name': album['title'],
                 'child': [song_child(slug, album['title'], meta, t, i + 1)
                           for i, t in enumerate(album['tracks'])],
-            }}, fmt)
+            }
+            directory.update(user_stats.get(did, 'album'))
+            return respond({'directory': directory}, fmt)
         return sub_error(fmt, 70, 'Directory not found.')
 
     if ep in ('getAlbum', 'getAlbumInfo', 'getAlbumInfo2'):
         aid = q.get('id', '')
+        track_match = re.fullmatch(r'track/(.+)/(\d+)', aid) if ep == 'getAlbumInfo' else None
         slug = aid[len('album/'):] if aid.startswith('album/') else aid
+        if track_match:
+            slug = track_match.group(1)
         album = load_album(slug)
-        if not album:
+        if not album or (track_match and not 1 <= int(track_match.group(2)) <= len(album['tracks'])):
             return sub_error(fmt, 70, 'Album not found.')
         meta = album_meta(slug, album)
         songs = [song_child(slug, album['title'], meta, t, i + 1)
                  for i, t in enumerate(album['tracks'])]
         if ep != 'getAlbum':
-            key = 'albumInfo' if ep == 'getAlbumInfo' else 'albumInfo2'
+            key = 'albumInfo'
             notes = []
             if meta.get('platforms'):
                 notes.append('Platforms: ' + ', '.join(meta['platforms']))
@@ -1619,8 +1796,18 @@ def _subsonic_dispatch(endpoint, request, q, multi):
         return respond({'album': out}, fmt)
 
     if ep in ('getAlbumList', 'getAlbumList2'):
-        kind = q.get('type', 'alphabeticalByName')
-        size = max(1, min(_int(q, 'size', 10), 500))
+        kind = q['type']
+        allowed = {'alphabeticalByName', 'alphabeticalByArtist', 'byGenre', 'byYear',
+                   'newest', 'random', 'starred', 'recent', 'frequent'}
+        if ep == 'getAlbumList':
+            allowed.add('highest')
+        if kind not in allowed:
+            return sub_error(fmt, 10, 'Invalid album list type.')
+        for param in (('genre',) if kind == 'byGenre' else
+                      ('fromYear', 'toYear') if kind == 'byYear' else ()):
+            if not q.get(param):
+                return sub_error(fmt, 10, 'Required parameter %s is missing.' % param)
+        size = max(0, min(_int(q, 'size', 10), 500))
         offset = max(0, _int(q, 'offset', 0))
         slugs = None
         if kind == 'byGenre':
@@ -1643,26 +1830,48 @@ def _subsonic_dispatch(endpoint, request, q, multi):
         elif kind == 'starred':
             slugs = [item_id[len('album/'):] for item_id, _ in user_stats.favorites('album')
                      if item_id.startswith('album/') and item_id[len('album/'):] in ALBUMS]
+        elif kind == 'alphabeticalByArtist':
+            slugs = sorted(ALPHA_SLUGS, key=lambda s: (
+                artist_name(ALBUMS[s]).casefold(), ALBUMS[s]['title'].casefold(), s))
+        elif kind in ('recent', 'frequent', 'highest'):
+            activity = user_stats.album_activity()
+            metric = {'recent': 'lastPlayedMs', 'frequent': 'playCount',
+                      'highest': 'rating'}[kind]
+            slugs = sorted(
+                (s for s, stats in activity.items() if s in ALBUMS and stats.get(metric)),
+                key=lambda s: (-activity[s][metric], ALBUMS[s]['title'].casefold(), s))
         if slugs is None:
             slugs = ALPHA_SLUGS
-        page = slugs[offset:offset + size]
+        page = slugs[offset:offset + size] if folder_ok else []
         key = 'albumList' if ep == 'getAlbumList' else 'albumList2'
         return respond({key: {'album': [album_child(s) for s in page]}}, fmt)
 
     if ep == 'getGenres':
         if GENRES:
-            genres = [{'_text': g, 'value': g, 'name': g,
-                       'albumCount': len(GENRE_ALBUMS[g]), 'songCount': 0} for g in GENRES]
+            genres = [{'_text': g, 'value': g,
+                       'albumCount': len(GENRE_ALBUMS[g]),
+                       'songCount': sum(_known_track_count(s) or 0 for s in GENRE_ALBUMS[g])}
+                      for g in GENRES]
         else:
             genres = [{'_text': 'Video Game Music', 'value': 'Video Game Music',
-                       'name': 'Video Game Music', 'albumCount': len(ALBUMS), 'songCount': 0}]
+                       'albumCount': len(ALBUMS),
+                       'songCount': sum(_known_track_count(s) or 0 for s in ALBUMS)}]
         return respond({'genres': {'genre': genres}}, fmt)
 
     if ep == 'getSongsByGenre':
-        # song-level genre browsing would need one album page fetch per album
-        return respond({'songsByGenre': {'song': []}}, fmt)
+        name = GENRE_LOOKUP.get(genre_key(q['genre']), q['genre'])
+        slugs = GENRE_ALBUMS.get(name, [])
+        if not GENRES and genre_key(name) == genre_key('Video Game Music'):
+            slugs = ALPHA_SLUGS
+        count = max(0, min(_int(q, 'count', 100), 500))
+        offset = max(0, _int(q, 'offset', 0))
+        songs = _catalog_songs(slugs, count, offset) if folder_ok else []
+        return respond({'songsByGenre': {'song': songs}}, fmt)
 
     if ep in ('search2', 'search3'):
+        key = 'searchResult2' if ep == 'search2' else 'searchResult3'
+        if not folder_ok:
+            return respond({key: {'artist': [], 'album': [], 'song': []}}, fmt)
         query = (q.get('query') or '').strip().strip('"')
         acount = max(0, _int(q, 'artistCount', 20))
         artoffset = max(0, _int(q, 'artistOffset', 0))
@@ -1691,7 +1900,7 @@ def _subsonic_dispatch(endpoint, request, q, multi):
                 artists = [artist_child(aid, name, count, image)
                            for aid, name, count in matches[artoffset:artoffset + acount]]
         else:
-            # An empty (or missing) query means "give me everything", paged by the
+            # An empty query means "give me everything", paged by the
             # count/offset parameters. Offline-first clients sync their whole
             # library through this branch instead of calling getArtists, so this
             # is what fills their artist and album lists.
@@ -1702,12 +1911,13 @@ def _subsonic_dispatch(endpoint, request, q, multi):
             if alcount:
                 albums = [album_child(s) for s in ALPHA_SLUGS[aoffset:aoffset + alcount]]
         songs = []
-        if query and song_index is not None:
-            scount = max(0, _int(q, 'songCount', 20))
-            soffset = max(0, _int(q, 'songOffset', 0))
-            if scount:
+        scount = max(0, _int(q, 'songCount', 20))
+        soffset = max(0, _int(q, 'songOffset', 0))
+        if scount:
+            if query and song_index is not None:
                 songs = song_index.search(query, scount, soffset)
-        key = 'searchResult2' if ep == 'search2' else 'searchResult3'
+            elif not query:
+                songs = _catalog_songs(ALPHA_SLUGS, scount, soffset)
         return respond({key: {'artist': artists, 'album': albums, 'song': songs}}, fmt)
 
     if ep == 'getPlaylists':
@@ -1805,6 +2015,14 @@ def _subsonic_dispatch(endpoint, request, q, multi):
 
     if ep == 'getCoverArt':
         cid = q.get('id', '')
+        size = None
+        if 'size' in q:
+            try:
+                size = int(q['size'])
+            except (ValueError, TypeError):
+                return sub_error(fmt, 10, 'Invalid cover art size.')
+            if not 1 <= size <= 4096:
+                return sub_error(fmt, 10, 'Cover art size must be between 1 and 4096.')
         slug = None
         if cid.startswith('album/'):
             slug = cid[len('album/'):]
@@ -1812,6 +2030,10 @@ def _subsonic_dispatch(endpoint, request, q, multi):
             m = re.match(r'^track/(.+)/\d+$', cid)
             if m:
                 slug = m.group(1)
+            elif cid.startswith(('pub/', 'letter/')):
+                rows = _albums_for_artist(cid)
+                if rows:
+                    slug = rows[0][0]
         album = load_album(slug) if slug else None
         if not album or not album.get('cover'):
             return sub_error(fmt, 70, 'Cover art not found.')
@@ -1821,8 +2043,25 @@ def _subsonic_dispatch(endpoint, request, q, multi):
             return sub_error(fmt, 0, 'Cover art fetch failed.')
         if r.status_code != 200:
             return sub_error(fmt, 70, 'Cover art not found.')
-        return Response(content=r.content,
-                        media_type=r.headers.get('content-type', 'image/jpeg'),
+        content = r.content
+        media_type = r.headers.get('content-type', 'image/jpeg')
+        if size is not None:
+            try:
+                with Image.open(io.BytesIO(content)) as original:
+                    image = ImageOps.exif_transpose(original)
+                    image.thumbnail((size, size), Image.Resampling.LANCZOS)
+                    output = io.BytesIO()
+                    if original.format == 'JPEG':
+                        image.convert('RGB').save(output, format='JPEG', quality=90)
+                        media_type = 'image/jpeg'
+                    else:
+                        image.save(output, format='PNG')
+                        media_type = 'image/png'
+                    content = output.getvalue()
+            except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
+                return sub_error(fmt, 0, 'Cover art image could not be resized.')
+        return Response(content=content,
+                        media_type=media_type,
                         headers={'Cache-Control': 'public, max-age=604800'})
 
     if ep in ('stream', 'download'):
@@ -1922,9 +2161,10 @@ def _subsonic_dispatch(endpoint, request, q, multi):
             return sub_error(fmt, 10, 'Rating must be an integer from 0 to 5.')
         if str(rating) != q.get('rating', '').strip() or not 0 <= rating <= 5:
             return sub_error(fmt, 10, 'Rating must be an integer from 0 to 5.')
-        if _song_by_id(song_id) is None:
-            return sub_error(fmt, 70, 'Song not found.')
-        user_stats.set_rating(song_id, rating)
+        media = _media_id(song_id)
+        if media is None:
+            return sub_error(fmt, 70, 'Song, album or artist not found.')
+        user_stats.set_rating(media[1], rating)
         return respond({}, fmt)
 
     if ep == 'scrobble':
@@ -1937,9 +2177,6 @@ def _subsonic_dispatch(endpoint, request, q, multi):
             submission = _bool_param(q.get('submission', 'true'))
         except ValueError:
             return sub_error(fmt, 10, 'Invalid submission parameter.')
-        # Now-playing notifications do not count as completed plays.
-        if not submission:
-            return respond({}, fmt)
         timestamps = multi.get('time', [])
         if timestamps and len(timestamps) != len(song_ids):
             return sub_error(fmt, 10, 'One time value is required per song id.')
@@ -1955,8 +2192,28 @@ def _subsonic_dispatch(endpoint, request, q, multi):
             if not 0 <= played_ms <= 253402300799999:
                 return sub_error(fmt, 10, 'Invalid scrobble timestamp.')
             entries.append((song_id, played_ms))
-        user_stats.record_plays(entries)
+        if submission:
+            user_stats.record_plays(entries)
+        else:
+            # Now-playing is a real state update, not a completed scrobble.
+            user_stats.set_now_playing(q['c'], song_ids[-1])
         return respond({}, fmt)
+
+    if ep == 'getNowPlaying':
+        now_ms = int(time.time() * 1000)
+        entries = []
+        for item in user_stats.now_playing():
+            song = _song_by_id(item['song_id'])
+            if song is None:
+                continue
+            elapsed = max(0, now_ms - item['startedAtMs'])
+            if elapsed > max(600000, (int(song.get('duration') or 0) + 60) * 1000):
+                continue
+            song.update(username=USERNAME, minutesAgo=elapsed // 60000,
+                        playerId=int(hashlib.sha256(item['client'].encode()).hexdigest()[:7], 16),
+                        playerName=item['client'])
+            entries.append(song)
+        return respond({'nowPlaying': {'entry': entries}}, fmt)
 
     if ep in ('getPlayHistory', 'getRecentlyPlayed'):
         # Relay extension: unlike getNowPlaying, this returns completed plays.
@@ -2030,7 +2287,39 @@ def _subsonic_dispatch(endpoint, request, q, multi):
         }}, fmt)
 
     if ep == 'savePlayQueue':
+        song_ids = multi.get('id', [])
+        if len(song_ids) > 10000:
+            return sub_error(fmt, 10, 'Too many play queue entries.')
+        current = q.get('current')
+        if current is not None and current not in song_ids:
+            return sub_error(fmt, 10, 'Current song must be present in the play queue.')
+        position = None
+        if 'position' in q:
+            try:
+                position = int(q['position'])
+            except (ValueError, TypeError):
+                return sub_error(fmt, 10, 'Invalid play queue position.')
+            if not 0 <= position <= 9223372036854775807:
+                return sub_error(fmt, 10, 'Invalid play queue position.')
+        if position is not None and current is None:
+            return sub_error(fmt, 10, 'Current song is required when saving a position.')
+        resolved = {}
+        entries = []
+        for song_id in song_ids:
+            if song_id not in resolved:
+                resolved[song_id] = _song_by_id(song_id)
+            if resolved[song_id] is None:
+                return sub_error(fmt, 70, 'Song not found: %s' % song_id)
+            entries.append(resolved[song_id])
+        user_stats.save_queue(entries, current, position, q['c'])
         return respond({}, fmt)
+
+    if ep == 'getPlayQueue':
+        queue = user_stats.get_queue()
+        queue['username'] = USERNAME
+        # Store metadata snapshots as well as IDs so a temporary upstream outage
+        # does not prevent another client from restoring an already saved queue.
+        return respond({'playQueue': queue}, fmt)
 
     if ep == 'getScanStatus':
         return respond({'scanStatus': {'scanning': False, 'count': len(ALBUMS)}}, fmt)
