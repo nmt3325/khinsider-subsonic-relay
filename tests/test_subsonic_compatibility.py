@@ -146,10 +146,13 @@ def test_invalid_queue_save_is_atomic_and_empty_queue_can_clear(relay):
         {'id': 'track/aaa/1', 'current': 'track/aaa/2'},
         {'id': 'track/aaa/1', 'current': 'track/aaa/1', 'position': -1},
         {'id': 'track/aaa/1', 'current': 'track/aaa/1', 'position': 'abc'},
-        {'id': 'track/aaa/1', 'position': 1},
     ]:
         assert api('savePlayQueue', **params)['status'] == 'failed'
         assert ok('getPlayQueue')['playQueue'] == before
+    # Both current and position are independently optional in the API.
+    ok('savePlayQueue', id='track/aaa/1', position=1)
+    assert ok('getPlayQueue')['playQueue']['position'] == 1
+    assert 'current' not in ok('getPlayQueue')['playQueue']
     ok('savePlayQueue')
     assert ok('getPlayQueue')['playQueue']['entry'] == []
     assert 'current' not in ok('getPlayQueue')['playQueue']

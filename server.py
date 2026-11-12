@@ -2301,8 +2301,6 @@ def _subsonic_dispatch(endpoint, request, q, multi):
                 return sub_error(fmt, 10, 'Invalid play queue position.')
             if not 0 <= position <= 9223372036854775807:
                 return sub_error(fmt, 10, 'Invalid play queue position.')
-        if position is not None and current is None:
-            return sub_error(fmt, 10, 'Current song is required when saving a position.')
         resolved = {}
         entries = []
         for song_id in song_ids:
