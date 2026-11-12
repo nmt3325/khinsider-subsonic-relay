@@ -500,10 +500,13 @@ class RuntimeServerTests(unittest.TestCase):
             track_url: [RuntimeError('boom'), DummyResponse(text=self.song_page_html({'flac': 'https://cdn.example.test/demo/full/01-track.flac'}))],
         })
 
-        first = module.resolve_track('demo', basename, requested_format='flac')
+        # Temporary upstream failures are now explicit (HTTP 503 at the API),
+        # rather than incorrectly becoming Song not found. Single-flight must
+        # still release the failed request so the next request can recover.
+        with self.assertRaises(module.UpstreamUnavailable):
+            module.resolve_track('demo', basename, requested_format='flac')
         second = module.resolve_track('demo', basename, requested_format='flac')
 
-        self.assertIsNone(first)
         self.assertEqual(second, {'files': {'flac': 'https://cdn.example.test/demo/full/01-track.flac'}})
         self.assertFalse(module._flights)
 
@@ -943,6 +946,133 @@ class RuntimeServerTests(unittest.TestCase):
             empty = client.get('/rest/getPlaylists.view', params=creds).json()
             self.assertEqual(empty['subsonic-response']['playlists']['playlist'], [])
 
+
+
+    def test_cloudflare_cold_album_recovers_actual_mp3(self):
+        module = self.load_server()
+        url = module.BASE + '/game-soundtracks/album/demo'
+        mp3 = 'https://nu.vgmtreasurechest.com/soundtracks/demo/hash/01.%20Track.mp3'
+        module.sess = FakeSession({url: DummyResponse(status_code=403,
+                                      headers={'cf-mitigated': 'challenge'})})
+        module.page_fetcher.solver_url = 'http://private-browser:8191/v1'
+        html = self.album_html(script=player_markup('1', mp3))
+        with mock.patch.object(module.page_fetcher, '_solve',
+                               return_value=(DummyResponse(text=html), {})) as solve:
+            r = TestClient(module.app).get('/rest/stream.view',
+                params={'u':'admin','p':'admin','id':'track/demo/1'}, follow_redirects=False)
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(r.headers['location'], mp3)
+        self.assertTrue(Path(module._cache_path('albums', 'demo')).exists())
+        solve.assert_called_once_with(url)
+
+    def test_cloudflare_unavailable_is_503_not_missing_song(self):
+        module = self.load_server()
+        url = module.BASE + '/game-soundtracks/album/demo'
+        module.sess = FakeSession({url: DummyResponse(status_code=403,
+                                      headers={'cf-mitigated': 'challenge'})})
+        r = TestClient(module.app).get('/rest/stream.view',
+             params={'u':'admin','p':'admin','id':'track/demo/1','f':'json'})
+        self.assertEqual(r.status_code, 503)
+        self.assertEqual(r.headers['retry-after'], '15')
+        self.assertEqual(r.json()['subsonic-response']['error']['code'], 0)
+        self.assertFalse(Path(module._cache_path('albums', 'demo')).exists())
+
+    def test_stale_album_is_preserved_when_upstream_is_blocked(self):
+        import time
+        module = self.load_server()
+        url = module.BASE + '/game-soundtracks/album/demo'
+        module.sess = FakeSession({url: DummyResponse(text=self.album_html())})
+        good = module.load_album('demo')
+        path = Path(module._cache_path('albums', 'demo'))
+        old = time.time() - 31 * 86400
+        os.utime(path, (old, old))
+        before = path.read_bytes()
+        module.sess = FakeSession({url: DummyResponse(status_code=403,
+                                      headers={'cf-mitigated': 'challenge'})})
+        self.assertEqual(module.load_album('demo'), good)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertAlmostEqual(path.stat().st_mtime, old, places=2)
+
+    def proxy_fixture(self, response):
+        module = self.load_server()
+        url = 'https://nu.vgmtreasurechest.com/soundtracks/demo/hash/01.mp3'
+        module.load_album = lambda slug: {'tracks':[{'basename':'01.mp3','formats':['mp3']}]}
+        module._resolve_stream_url = lambda *a, **k: (url, {'mp3':url})
+        response.close = mock.Mock()
+        session = FakeSession({url:response})
+        session.get = mock.Mock(side_effect=session.get)
+        session.head = mock.Mock(return_value=response)
+        module.sess = session
+        return module, TestClient(module.app), url
+
+    def test_proxy_preserves_range_audio_bytes_and_closes(self):
+        data = b'ID3' + bytes(range(32))
+        source = DummyResponse(content=data, status_code=206, headers={
+            'Content-Type':'audio/mpeg','Content-Length':str(len(data)),
+            'Content-Range':'bytes 50-84/1000','Accept-Ranges':'bytes','ETag':'test'})
+        module,client,url = self.proxy_fixture(source)
+        r = client.get('/rest/stream.view', params={'u':'admin','p':'admin',
+            'id':'track/demo/1','proxy':'1'}, headers={
+                'Range':'bytes=50-84','If-Range':'test','Accept-Encoding':'gzip'})
+        self.assertEqual(r.status_code, 206)
+        self.assertEqual(r.content, data)
+        self.assertEqual(r.headers['content-range'], 'bytes 50-84/1000')
+        self.assertEqual(r.headers['accept-ranges'], 'bytes')
+        self.assertEqual(r.headers['content-type'], 'audio/mpeg')
+        self.assertNotIn('content-encoding', r.headers)
+        self.assertEqual(module.sess.get.call_args.kwargs['headers'], {
+            'Accept-Encoding':'identity','Range':'bytes=50-84','If-Range':'test'})
+        source.close.assert_called_once()
+
+    def test_proxy_head_returns_audio_headers_without_body(self):
+        source = DummyResponse(headers={'Content-Type':'audio/mpeg','Content-Length':'12345',
+                                         'Accept-Ranges':'bytes'})
+        module,client,url = self.proxy_fixture(source)
+        r = client.head('/rest/stream.view', params={'u':'admin','p':'admin',
+            'id':'track/demo/1','proxy':'1'})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, b'')
+        self.assertEqual(r.headers['content-length'], '12345')
+        module.sess.head.assert_called_once()
+        module.sess.get.assert_not_called()
+        source.close.assert_called_once()
+
+    def test_proxy_never_returns_html_as_successful_audio(self):
+        source = DummyResponse(text='<html>error</html>', headers={'Content-Type':'text/html'})
+        module,client,url = self.proxy_fixture(source)
+        r = client.get('/rest/stream.view', params={'u':'admin','p':'admin',
+            'id':'track/demo/1','proxy':'1','f':'json'})
+        self.assertEqual(r.status_code, 503)
+        self.assertNotIn('audio/', r.headers['content-type'])
+        source.close.assert_called_once()
+
+    def test_proxy_range_unsatisfiable_preserves_416(self):
+        source = DummyResponse(status_code=416, content=b'bad range', headers={
+            'Content-Range':'bytes */1000','Content-Length':'9'})
+        module,client,url = self.proxy_fixture(source)
+        r = client.get('/rest/stream.view', params={'u':'admin','p':'admin',
+            'id':'track/demo/1','proxy':'1'}, headers={'Range':'bytes=2000-'})
+        self.assertEqual(r.status_code, 416)
+        self.assertEqual(r.headers['content-range'], 'bytes */1000')
+        self.assertEqual(r.content, b'')
+        self.assertEqual(r.headers['content-length'], '0')
+
+    def test_proxy_refreshes_changed_cdn_url_from_real_song_page(self):
+        source = DummyResponse(status_code=404)
+        module,client,old_url = self.proxy_fixture(source)
+        fresh_url = old_url.replace('/hash/', '/new-hash/')
+        fresh = DummyResponse(content=b'ID3new-audio', headers={'Content-Type':'audio/mpeg'})
+        fresh.close = mock.Mock()
+        module.sess.routes[fresh_url] = fresh
+        with mock.patch.object(module, '_resolve_track_page',
+                               return_value={'files':{'mp3':fresh_url}}) as resolve:
+            r = client.get('/rest/stream.view', params={'u':'admin','p':'admin',
+                'id':'track/demo/1','proxy':'1'})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, b'ID3new-audio')
+        resolve.assert_called_once_with('demo','01.mp3',force_refresh=True)
+        source.close.assert_called_once()
+        fresh.close.assert_called_once()
 
 if __name__ == '__main__':
     unittest.main()

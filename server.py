@@ -85,6 +85,9 @@ from curl_cffi import requests as creq
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from khinsider_player import extract_player_urls, valid_mp3_url
+from khinsider_http import PageFetcher, UpstreamUnavailable
+from starlette.concurrency import run_in_threadpool
+from starlette.background import BackgroundTask
 from playlists import PlaylistStore
 from user_stats import UserStatsStore
 from search_utils import normalize_text, rank_normalized, rank_text
@@ -100,7 +103,7 @@ else:
 BASE = 'https://downloads.khinsider.com'
 API_VERSION = '1.16.1'
 SERVER_TYPE = 'khinsider-relay'
-SERVER_VERSION = '0.6.0'
+SERVER_VERSION = '0.6.1'
 USERNAME = os.environ.get('SUBSONIC_USER', 'admin')
 PASSWORD = os.environ.get('SUBSONIC_PASSWORD', 'admin')
 CACHE_DIR = os.environ.get('CACHE_DIR', './cache')
@@ -149,6 +152,11 @@ os.makedirs(os.path.join(CACHE_DIR, 'tracks'), exist_ok=True)
 playlist_store = PlaylistStore(PLAYLISTS_PATH, USERNAME)
 user_stats = UserStatsStore(USER_STATS_PATH)
 sess = creq.Session(impersonate='chrome')
+page_fetcher = PageFetcher(
+    os.environ.get('FLARESOLVERR_URL', ''),
+    os.environ.get('CLOUDFLARE_CLEARANCE_PATH') or os.path.join(CACHE_DIR, 'cloudflare-clearance.json'),
+    os.environ.get('FLARESOLVERR_TIMEOUT_MS', '60000'),
+)
 
 # ---------------- metadata helpers ----------------
 
@@ -985,7 +993,13 @@ def load_album(slug):
         if cached and cached.get('v') == ALBUM_CACHE_VERSION:
             return cached
         try:
-            r = sess.get('%s/game-soundtracks/album/%s' % (BASE, slug), timeout=30)
+            r = page_fetcher.get('%s/game-soundtracks/album/%s' % (BASE, slug), sess)
+        except UpstreamUnavailable:
+            stale = _cache_get('albums', slug, max_age=90 * 86400)
+            if stale and stale.get('v') == ALBUM_CACHE_VERSION and stale.get('tracks'):
+                print('album upstream unavailable; using last good cache for %s' % slug, flush=True)
+                return stale
+            raise
         except Exception as exc:
             print('album fetch failed for %s: %s' % (slug, exc))
             return None
@@ -1035,6 +1049,8 @@ def load_album(slug):
 
     try:
         return _singleflight('album:' + slug, leader)
+    except UpstreamUnavailable:
+        raise
     except Exception as exc:
         print('album fetch failed for %s: %s' % (slug, exc))
         return None
@@ -1054,15 +1070,15 @@ def _cached_direct_mp3(slug, basename):
     return None
 
 
-def _resolve_track_page(slug, basename):
+def _resolve_track_page(slug, basename, force_refresh=False):
     """Track page -> {'files': {ext: cdn_url}}, cached for 30 days."""
     key = '%s/%s' % (slug, basename)
-    cached = _cache_get('tracks', key, max_age=30 * 86400)
+    cached = None if force_refresh else _cache_get('tracks', key, max_age=30 * 86400)
     if cached:
         return cached
 
     def leader():
-        cached = _cache_get('tracks', key, max_age=30 * 86400)
+        cached = None if force_refresh else _cache_get('tracks', key, max_age=30 * 86400)
         if cached:
             return cached
         # Keep caller IDs/cache keys stable, but use an already confirmed
@@ -1073,7 +1089,13 @@ def _resolve_track_page(slug, basename):
         url = '%s/game-soundtracks/album/%s/%s' % (
             BASE, target, urllib.parse.quote(basename))
         try:
-            r = sess.get(url, timeout=30)
+            r = page_fetcher.get(url, sess)
+        except UpstreamUnavailable:
+            stale = None if force_refresh else _cache_get('tracks', key, max_age=90 * 86400)
+            if stale and stale.get('files'):
+                print('track upstream unavailable; using last good cache for %s' % key, flush=True)
+                return stale
+            raise
         except Exception as exc:
             print('track fetch failed for %s: %s' % (key, exc))
             return None
@@ -1095,7 +1117,9 @@ def _resolve_track_page(slug, basename):
         return data
 
     try:
-        return _singleflight('track:' + key, leader)
+        return _singleflight('track:' + key + (':refresh' if force_refresh else ''), leader)
+    except UpstreamUnavailable:
+        raise
     except Exception as exc:
         print('track fetch failed for %s: %s' % (key, exc))
         return None
@@ -1437,6 +1461,7 @@ def _int(q, key, default=0):
 
 
 @app.get('/rest/{endpoint}')
+@app.head('/rest/{endpoint}')
 @app.post('/rest/{endpoint}')
 async def subsonic(endpoint: str, request: Request):
     q = dict(request.query_params)
@@ -1451,6 +1476,19 @@ async def subsonic(endpoint: str, request: Request):
                 q.setdefault(k, str(v))
         except Exception:
             pass
+    try:
+        # Page recovery and CDN I/O are synchronous: do not stall the ASGI loop.
+        return await run_in_threadpool(_subsonic_dispatch, endpoint, request, q, multi)
+    except UpstreamUnavailable as exc:
+        print('upstream temporarily unavailable: %s' % exc, flush=True)
+        fmt = 'json' if q.get('f') in ('json', 'jsonp') else 'xml'
+        response = sub_error(fmt, 0, 'KHInsider is temporarily unavailable. Please retry shortly.')
+        response.status_code = 503
+        response.headers['Retry-After'] = '15'
+        return response
+
+
+def _subsonic_dispatch(endpoint, request, q, multi):
     fmt = 'json' if q.get('f') in ('json', 'jsonp') else 'xml'
     ep = endpoint[:-5] if endpoint.endswith('.view') else endpoint
 
@@ -1803,16 +1841,76 @@ async def subsonic(endpoint: str, request: Request):
             return sub_error(fmt, 70, 'Song not found.')
         if not (PROXY_STREAM or q.get('proxy') == '1'):
             return RedirectResponse(url, status_code=302)
-        suffix = (AUDIO_EXT_RE.search(urllib.parse.urlparse(url).path).group(1) or 'mp3').lower()
-        upstream = sess.get(url, stream=True, timeout=60)
+        forward = {'Accept-Encoding': 'identity'}
+        for name in ('Range', 'If-Range'):
+            if request.headers.get(name):
+                forward[name] = request.headers[name]
+        upstream = None
+        try:
+            for attempt in range(2):
+                if request.method == 'HEAD':
+                    upstream = sess.head(url, headers=forward, timeout=60)
+                else:
+                    upstream = sess.get(url, headers=forward, stream=True, timeout=60)
+                if upstream.status_code not in (403, 404, 410) or attempt:
+                    break
+                # A cached CDN hash may have changed. Re-read the actual song
+                # page once, never derive another URL by changing its hash/ext.
+                upstream.close()
+                upstream = None
+                fresh = _resolve_track_page(slug, track['basename'], force_refresh=True)
+                current = dict((fresh or {}).get('files') or {})
+                preferred = (track.get('formats') or ['mp3'])[0]
+                fresh_url = current.get(want) or current.get(preferred) or current.get('mp3') or next(iter(current.values()), None)
+                if not fresh_url:
+                    raise UpstreamUnavailable('Audio URL refresh failed')
+                url = fresh_url
+        except Exception as exc:
+            if upstream is not None:
+                upstream.close()
+            if isinstance(exc, UpstreamUnavailable):
+                raise
+            raise UpstreamUnavailable('Audio source request failed (%s)' % type(exc).__name__) from exc
+
+        received = {str(k).lower(): str(v) for k, v in upstream.headers.items()}
+        headers = {name: received[name.lower()] for name in (
+            'Content-Length', 'Content-Range', 'Accept-Ranges', 'ETag', 'Last-Modified')
+            if received.get(name.lower())}
+        if upstream.status_code == 416:
+            upstream.close()
+            # A 416 body is not audio and its original length must not escape.
+            headers.pop('Content-Length', None)
+            return Response(status_code=416, headers=headers)
+        content_type = received.get('content-type', '').split(';', 1)[0].lower()
+        if (upstream.status_code not in (200, 206)
+                or content_type in ('text/html', 'application/json', 'application/xml')
+                or received.get('content-encoding', 'identity').lower() not in ('', 'identity')):
+            status = upstream.status_code
+            upstream.close()
+            raise UpstreamUnavailable('Audio source returned non-audio HTTP %s' % status)
+        suffix_match = AUDIO_EXT_RE.search(urllib.parse.urlparse(url).path)
+        suffix = suffix_match.group(1).lower() if suffix_match else 'mp3'
+        media_type = content_type if content_type.startswith('audio/') else CONTENT_TYPES.get(suffix, 'audio/mpeg')
+        if request.method == 'HEAD':
+            upstream.close()
+            return Response(status_code=upstream.status_code, media_type=media_type, headers=headers)
+        closed = False
+
+        def close_upstream():
+            nonlocal closed
+            if not closed:
+                closed = True
+                upstream.close()
 
         def body():
-            for chunk in upstream.iter_content(chunk_size=65536):
-                yield chunk
+            try:
+                yield from upstream.iter_content(chunk_size=65536)
+            finally:
+                close_upstream()
 
-        return StreamingResponse(body(), media_type=CONTENT_TYPES.get(suffix, 'audio/mpeg'),
-                                 headers={'Content-Length': upstream.headers['Content-Length']}
-                                 if upstream.headers.get('Content-Length') else None)
+        return StreamingResponse(body(), status_code=upstream.status_code,
+                                 media_type=media_type, headers=headers,
+                                 background=BackgroundTask(close_upstream))
 
     if ep == 'setRating':
         song_id = q.get('id')

@@ -18,22 +18,44 @@ services:
       # 独自SONGS_URLを使う場合は対応するmanifestだけを明示指定する
       # SONGS_MANIFEST_URL: "https://your-host.example/songs-index.json"
       # SONGS_MANIFEST_URL: ""  # manifestを使わずgzipの内容検証にする
-      # PROXY_STREAM: "1"   # リダイレクト非対応クライアント用の中継モード
+      PROXY_STREAM: "1"   # 同一URLで音声・Range/HEADを返す（0で従来の302）
+      FLARESOLVERR_URL: http://flaresolverr:8191/v1
       # SONG_SEARCH: "off"  # 曲名検索を無効化（曲 DB を作らない = 約 600MB 節約）
     volumes:
       - khinsider-data:/data
       # ホスト側の見えるディレクトリに置きたい場合は上の行を消してこちらを使う:
       # - ./data:/data
     restart: unless-stopped
+    depends_on:
+      flaresolverr:
+        condition: service_healthy
     healthcheck:
       test:
         - CMD
         - python3
         - -c
         - import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT', '8080') + '/', timeout=10)
-      interval: 5m
-      timeout: 15s
-      start_period: 5m
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+  flaresolverr:
+    # FlareSolverr 3.5.2, pinned multi-architecture image (includes ARM64).
+    image: ghcr.io/flaresolverr/flaresolverr@sha256:c80ae007ce2ccdcd217a12426e4f039ef763ff90738c808d38810c3e59323767
+    restart: unless-stopped
+    shm_size: 512mb
+    mem_limit: 2g
+    cpus: 2
+    environment:
+      LOG_LEVEL: warn
+      LOG_HTML: "false"
+    # No published port: only the relay's Docker network can use the browser.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8191/', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
       retries: 3
 
 volumes:

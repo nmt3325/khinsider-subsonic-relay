@@ -13,6 +13,14 @@ downloads.khinsider.com の全アルバム（104,607件 / 2026-09-04時点）を
 3. `/rest/stream` は実ファイルの CDN URL へ 302 リダイレクト。リダイレクト非対応クライアント向けに `PROXY_STREAM=1` でサーバー中継モードも可
 4. 曲名検索用に、325万曲の曲名インデックスを別途ダウンロードしてローカルの SQLite FTS5 に展開（[曲名検索](#曲名検索)）
 
+### Cloudflare / クライアント再生（v0.6.1）
+
+- 通常は `curl_cffi` で取得し、Cloudflare チャレンジを検知した場合だけ `FLARESOLVERR_URL` のブラウザへフォールバックします。同梱 Compose は ARM64 対応の FlareSolverr を内部ネットワークだけで起動します。8191 をインターネットに公開しないでください。
+- ブラウザの User-Agent と期限付き・KHInsider ドメイン限定の clearance cookie を組み合わせて再利用します。`CACHE_DIR/cloudflare-clearance.json` は0600で保存し、CookieやページHTMLをログへ出しません。通常の再取得や再起動で毎回ブラウザを起動する必要はありません。
+- Compose は `PROXY_STREAM=1` を推奨値とし、クライアントには同じサーバーURLから実音声を返します。Range / If-Range、206 / 416、HEAD と Content-Range を保持し、音声をgzip再圧縮しません。CDNが403/404/410を返した場合は実際の曲ページから一度だけURLを取り直します。`PROXY_STREAM=0` なら従来の302に戻せます。
+- 上流の一時障害時は90日以内の最後に検証したキャッシュを利用し、正常なファイルをエラーページで上書きしません。利用できるキャッシュもない場合は HTTP 503 / Retry-After を返し、「曲が存在しない」と区別します。ネットワーク取得はASGIイベントループを止めません。
+- 音声CDNがHTML・JSON等を返した場合、それを成功した音声としてクライアントへ流しません。中継モードでは音声ファイルを保存しませんが、再生帯域はサーバーを通ります。
+
 ### 追加取得を減らす経路
 
 - 対応しているアルバムでは、ページ内プレイヤーの実MP3 URLを曲の `songid` と結合します。MP3再生時に曲ごとのページ取得を省けます。JavaScriptは実行しません。
@@ -143,7 +151,10 @@ Subsonic API 互換クライアント（Symfonium / Tempo / DSub / Substreamer /
 | `LIBRARY_MAX_AGE_HOURS` | `LIBRARY_REFRESH_HOURS` | 起動時にキャッシュを再取得する古さのしきい値。旧来の名前で、通常は指定不要 |
 | `CACHE_DIR` | `./cache` | ページキャッシュ先（アルバム30日）。Docker では `/data/cache` |
 | `PLAYLISTS_PATH` | `library.json` と同じディレクトリの `playlists.json` | プレイリスト永続化ファイル。Docker では `/data/playlists.json` |
-| `PROXY_STREAM` | - | `1` で302ではなくサーバー中継 |
+| `PROXY_STREAM` | -（Composeは`1`） | `1` でRange/HEAD対応のサーバー中継。`0`で302 |
+| `FLARESOLVERR_URL` | - | チャレンジ時の内部ブラウザ取得先（例 `http://flaresolverr:8191/v1`） |
+| `FLARESOLVERR_TIMEOUT_MS` | `60000` | ブラウザ取得の上限（10,000–120,000ms） |
+| `CLOUDFLARE_CLEARANCE_PATH` | `CACHE_DIR/cloudflare-clearance.json` | 0600で保存する期限付きclearanceの保存先 |
 | `GZIP_MIN_SIZE` | `1024` | このバイト数以上のAPI応答をgzip圧縮（負値で無効）。アーティスト一覧は約1.5MB→約0.3MBになります。音声とジャケット画像は圧縮しません |
 | `GZIP_LEVEL` | `6` | gzip圧縮レベル 1-9 |
 | `GENRE_SOURCES` | `platform,album_type` | ジャンルに使う項目と順序。`album_type,platform` や `album_type` 単独も可 |

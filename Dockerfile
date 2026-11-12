@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py songs.py playlists.py user_stats.py search_utils.py khinsider_player.py ./
+COPY server.py songs.py playlists.py user_stats.py search_utils.py khinsider_player.py khinsider_http.py ./
 
 # /data is the only writable state: library.json, the song index, playlists, user ratings/history and
 # the album page cache. Mount a volume there or everything is rebuilt on
